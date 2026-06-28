@@ -1,0 +1,13 @@
+# Virtual environment
+.venv/
+env/
+venv/
+
+# Python caching
+__pycache__/
+*.pyc
+
+# Project specific heavy folders
+checkpoints/
+data/
+results/

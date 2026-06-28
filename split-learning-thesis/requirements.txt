@@ -1,1 +1,30 @@
 
+# requirements.txt
+# Python 3.11.9 compatible — tested stack for Split Learning thesis
+# Install with: pip install -r requirements.txt
+
+# ── PyTorch (install separately via torch index URL) ──
+# torch==2.3.1
+# torchvision==0.18.1
+# torchaudio==2.3.1
+
+# ── Scientific computing ──────────────────────────────
+numpy==1.26.4
+
+# ── Visualization ─────────────────────────────────────
+matplotlib==3.9.0
+seaborn==0.13.2
+Pillow==10.3.0
+
+# ── Machine learning utilities ────────────────────────
+scikit-learn==1.5.0
+
+# ── Data handling ─────────────────────────────────────
+pandas==2.2.2
+
+# ── Training utilities ────────────────────────────────
+tqdm==4.66.4
+
+# ── Jupyter (optional) ────────────────────────────────
+# ipykernel==6.29.4
+# jupyter==1.0.0

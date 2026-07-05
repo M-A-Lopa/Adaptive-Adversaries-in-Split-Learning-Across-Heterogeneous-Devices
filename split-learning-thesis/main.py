@@ -2,6 +2,7 @@
 # Run this file to start Vanilla Split Learning training
 # Command: python main.py
 
+import os
 import torch
 import matplotlib.pyplot as plt
 from config import Config
@@ -10,12 +11,11 @@ from models import ClientModel, ServerModel
 from split_learning import SplitLearningTrainer
 
 
-def plot_results(train_losses, train_accuracies, test_accuracies):
-    #Plots and saves training curves
+
+def plot_results(train_losses, train_accuracies, test_accuracies, dataset_name):
     epochs = range(1, len(train_losses) + 1)
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
 
-    # -------------------Loss curve--------------------------
     ax1.plot(epochs, train_losses, 'b-', linewidth=2, label='Train Loss')
     ax1.set_title('Training Loss', fontsize=13)
     ax1.set_xlabel('Epoch')
@@ -23,7 +23,6 @@ def plot_results(train_losses, train_accuracies, test_accuracies):
     ax1.legend()
     ax1.grid(True, alpha=0.3)
 
-    # -------------------Accuracy curve--------------------------
     ax2.plot(epochs, train_accuracies, 'b-', linewidth=2, label='Train Accuracy')
     ax2.plot(epochs, test_accuracies,  'r-', linewidth=2, label='Test Accuracy')
     ax2.set_title('Model Accuracy', fontsize=13)
@@ -32,12 +31,13 @@ def plot_results(train_losses, train_accuracies, test_accuracies):
     ax2.legend()
     ax2.grid(True, alpha=0.3)
 
-    plt.suptitle(f'Vanilla Split Learning — {Config.DATASET}', fontsize=14)
+    plt.suptitle(f'Vanilla Split Learning — {dataset_name}', fontsize=14)
     plt.tight_layout()
 
-    save_path = f"{Config.RESULTS_DIR}/training_curves.png"
+    save_path = f"{Config.RESULTS_DIR}/training_curves_{dataset_name}.png"
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.show()
+    os.makedirs(Config.RESULTS_DIR, exist_ok=True)
     print(f"Training curves saved → {save_path}")
 
 
@@ -68,4 +68,4 @@ if __name__ == "__main__":
 
     # ------------------Save results and plot---------------------
     trainer.save_results()
-    plot_results(train_losses, train_accs, test_accs)
+    plot_results(train_losses, train_accs, test_accs, Config.DATASET)

@@ -187,7 +187,7 @@ class SplitLearningTrainer:
                         'cut_layer' : Config.CUT_LAYER,
                         'lr'        : Config.LEARNING_RATE
                     }
-                }, f"{Config.SAVE_DIR}/best_vanilla_sl.pth")
+                }, f"{Config.SAVE_DIR}/best_vanilla_sl_{Config.DATASET}.pth")
 
         print(f"\nTraining complete. Best Test Accuracy: {best_acc:.2f}%")
         return self.train_losses, self.train_accuracies, self.test_accuracies
@@ -200,6 +200,7 @@ class SplitLearningTrainer:
             'train_accuracy' : self.train_accuracies,
             'test_accuracy'  : self.test_accuracies
         })
-        path = f"{Config.RESULTS_DIR}/vanilla_sl_results.csv"
+        # dataset name included in filename
+        path = f"{Config.RESULTS_DIR}/vanilla_sl_results_{Config.DATASET}.csv"
         df.to_csv(path, index=False)
         print(f"Results saved → {path}")

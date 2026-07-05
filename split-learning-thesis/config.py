@@ -4,7 +4,7 @@
 class Config:
 
     # ----------------------Dataset--------------------------
-    DATASET       = 'CIFAR10'   # Switch to 'MNIST' anytime
+    DATASET       = 'CIFAR10'   # Switch to 'MNIST'/'CIFAR10' anytime 
     DATA_DIR      = './data'
     NUM_CLASSES   = 10
 

@@ -1,11 +1,15 @@
-# Core Vanilla Split Learning training and evaluation logic
+# split_learning.py
+# Vanilla Split Learning — Training and Evaluation Engine
 #
 # How the backward pass works:
-# 1. Server computes loss and calls loss.backward()
-# 2. This gives us gradient w.r.t. smashed_data (smashed_data_detached.grad)
-# 3. We send this gradient back to the client
-# 4. Client calls smashed_data.backward(gradient) to update its layers
-# This simulates the gradient communication in real SL deployments
+# 1. Client computes smashed data from input
+# 2. Server receives smashed data, computes loss, calls backward
+# 3. Gradient of smashed data flows back to client
+# 4. Client uses gradient to update its own layers
+#
+# Attack integration:
+# get_smashed_data() exposes intermediate activations for attack evaluation
+# evaluate_with_defense() measures accuracy cost of any defense function
 
 
 import os
@@ -15,18 +19,25 @@ import torch.optim as optim
 from tqdm import tqdm
 import pandas as pd
 from config import Config
-from all_defences.pgsl_defense import AdaptiveWeightedDecisionFusion, PGSLDefenseModules
 
 
 class SplitLearningTrainer:
+    """
+    Trains client and server models using Vanilla Split Learning protocol.
+    Simulates two-party communication via smashed data and gradient exchange.
 
-    def __init__(self, client_model, server_model, train_loader, test_loader):
+    After training, the client model can be passed directly to
+    WhiteBoxInversionAttack — the attack calls client_model(inputs)
+    to obtain smashed data without needing any changes here.
+    """
 
-        # Device setup
+    def __init__(self, client_model, server_model,
+                 train_loader, test_loader):
+
         self.device = torch.device(
             Config.DEVICE if torch.cuda.is_available() else 'cpu'
         )
-        print(f"Device: {self.device}")
+        print(f"  Device: {self.device}")
 
         # Move models to device
         self.client_model = client_model.to(self.device)
@@ -35,36 +46,55 @@ class SplitLearningTrainer:
         self.train_loader = train_loader
         self.test_loader  = test_loader
 
-        # Separate optimizers — simulates client and server updating independently
-        self.client_optimizer = optim.Adam(self.client_model.parameters(), lr=Config.LEARNING_RATE)
-        self.server_optimizer = optim.Adam( self.server_model.parameters(), lr=Config.LEARNING_RATE)
+        # Separate optimizers — simulates client and server
+        # updating their own weights independently
+        self.client_optimizer = optim.Adam(
+            self.client_model.parameters(),
+            lr=Config.LEARNING_RATE
+        )
+        self.server_optimizer = optim.Adam(
+            self.server_model.parameters(),
+            lr=Config.LEARNING_RATE
+        )
 
-        # Learning rate scheduler — reduces LR when accuracy plateaus
-        self.client_scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.client_optimizer, patience=5, factor=0.5, verbose=True)
-        self.server_scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.server_optimizer, patience=5, factor=0.5, verbose=True)
+        # Reduce LR when accuracy plateaus — prevents overfitting
+        self.client_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.client_optimizer, patience=5, factor=0.5
+        )
+        self.server_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.server_optimizer, patience=5, factor=0.5
+        )
 
         self.criterion = nn.CrossEntropyLoss()
 
-        # Result tracking
-        self.train_losses      = []
-        self.train_accuracies  = []
-        self.test_accuracies   = []
+        # Metric history — used for plotting and CSV export
+        self.train_losses     = []
+        self.train_accuracies = []
+        self.test_accuracies  = []
 
-        os.makedirs(Config.SAVE_DIR,   exist_ok=True)
+        os.makedirs(Config.SAVE_DIR,    exist_ok=True)
         os.makedirs(Config.RESULTS_DIR, exist_ok=True)
 
-    # --------------------------Single epoch training--------------------------
-    def train_one_epoch(self, epoch):
+    # ── Single epoch training ─────────────────────────────────────────
+    def _train_one_epoch(self, epoch):
+        """
+        Runs one full training epoch using the SL communication protocol.
+
+        The detach + requires_grad trick simulates network communication:
+        - smashed_data_server is what the server actually receives
+        - its .grad after server backward = the gradient message sent back
+        - client uses that gradient to update its own layers
+        """
         self.client_model.train()
         self.server_model.train()
 
         running_loss = 0.0
-        correct = 0
-        total   = 0
+        correct      = 0
+        total        = 0
 
         progress_bar = tqdm(
             self.train_loader,
-            desc=f"Epoch [{epoch+1}/{Config.EPOCHS}]",
+            desc=f"  Epoch [{epoch+1}/{Config.EPOCHS}]",
             leave=False
         )
 
@@ -72,85 +102,41 @@ class SplitLearningTrainer:
             inputs = inputs.to(self.device)
             labels = labels.to(self.device)
 
-            # =========================================================================
-            # PHASE 1: Connected Baseline Pass (Graph Intact for Jacobian Calculation)
-            # =========================================================================
-            inputs.requires_grad_(True)
-            
-            # Downsample the raw unperturbed image with the empty tracking placeholder channel
-            baseline_tensor = PGSLDefenseModules.space_to_depth_downsample(inputs, saliency_map=None)
-            
-            # Forward pass with autograd ACTIVE so the graph links inputs -> s_baseline -> baseline_logits
-            s_baseline = self.client_model(baseline_tensor)
-            
-            # Fast evaluation pass through the server's attacked stream head
-            baseline_logits, _, _ = self.server_model(s_baseline, run_full_pipeline=False)
-
-            # =========================================================================
-            # PHASE 2: True Saliency Generation, Disconnection, and Defensive Training
-            # =========================================================================
-            # Generate the faithful quantitative reversed JSMA map using the active graph
-            x_perturbed, map_tensor = PGSLDefenseModules.generate_faithful_saliency_map(
-                inputs=inputs,
-                baseline_logits=baseline_logits,
-                num_classes=Config.NUM_CLASSES
-            )
-
-            # Crucial Step: Clear the active optimization gradients across both modules 
-            # to completely wipe any intermediate tracking artifacts from the Phase 1 Jacobian computation
+            # ── CLIENT FORWARD PASS ───────────────────────────────────
             self.client_optimizer.zero_grad()
+            smashed_data = self.client_model(inputs)
+            # smashed_data shape: [batch, 32, 8, 8] for CIFAR-10
+            #                     [batch, 32, 5, 5] for MNIST
+
+            # Detach from client graph — simulates sending over network
+            # requires_grad=True allows gradient to flow back from server
+            smashed_data_server = smashed_data.detach().requires_grad_(True)
+
+            # ── SERVER FORWARD PASS ───────────────────────────────────
             self.server_optimizer.zero_grad()
+            outputs = self.server_model(smashed_data_server)
+            loss    = self.criterion(outputs, labels)
 
-            # Construct the true 4ch + 1 active tensor layout using the newly generated maps
-            client_tensor = PGSLDefenseModules.space_to_depth_downsample(x_perturbed, map_tensor)
-
-            # Forward Pass to create actual training intermediate activations
-            s_client_output = self.client_model(client_tensor)
-
-            # --- TRUE GRADIENT TRANSMISSION ISOLATION ---
-            # Detach to create an explicit server-side leaf node, cutting graph communication back to the client
-            s_server_leaf = s_client_output.detach().requires_grad_(True)
-
-            # Process through the server's separate backbones
-            out_a, out_r, out_f = self.server_model(s_server_leaf, run_full_pipeline=True)
-
-            # Compute the three distinct structural losses
-            loss_a = self.criterion(out_a, labels)
-            loss_r = self.criterion(out_r, labels)
-            loss_f = self.criterion(out_f, labels)
-
-            # 1. Backpropagate Attacked and Recovered losses. Gradients accumulate on server 
-            # parameters, and their impact over s_server_leaf is calculated but trapped there.
-            loss_a.backward(retain_graph=True)
-            loss_r.backward(retain_graph=True)
-
-            # Zero out any mixed leaf gradients accumulated on s_server_leaf from streams A and R
-            s_server_leaf.grad.zero_()
-
-            # 2. Backpropagate Fused stream loss. 
-            loss_f.backward() 
-
-            # Extract the true, unpolluted gradient generated EXCLUSIVELY by the fused stream
-            fused_gradient_only = s_server_leaf.grad
-
-            # 3. Manually pass this clean gradient block back to the client graph
-            s_client_output.backward(gradient=fused_gradient_only)
-
-            # Complete structural optimization parameter update steps
+            # ── SERVER BACKWARD PASS ──────────────────────────────────
+            # Server computes gradient of loss w.r.t. smashed data
+            # This gradient is the message sent back to client
+            loss.backward()
             self.server_optimizer.step()
+
+            # ── CLIENT BACKWARD PASS ──────────────────────────────────
+            # smashed_data_server.grad is the gradient from server
+            # Client uses this to backpropagate through its own layers
+            smashed_data.backward(smashed_data_server.grad)
             self.client_optimizer.step()
 
-            # Adaptive Late Decision Fusion logic for metric tracking and evaluation
-            final_logits = AdaptiveWeightedDecisionFusion.fuse_outputs(out_a, out_r, out_f)
-
-            # --------------------------Track metrics--------------------------
-            running_loss += loss_f.item()  # Tracking the main defensive fusion loss
-            _, predicted  = final_logits.max(1)
+            # ── Track metrics ─────────────────────────────────────────
+            running_loss += loss.item()
+            _, predicted  = outputs.max(1)
             total        += labels.size(0)
             correct      += predicted.eq(labels).sum().item()
 
             progress_bar.set_postfix({
-                'Loss': f'{loss_f.item():.4f}',
+                'Loss': f'{loss.item():.4f}',
                 'Acc' : f'{100.*correct/total:.2f}%'
             })
 
@@ -162,8 +148,12 @@ class SplitLearningTrainer:
 
         return epoch_loss, epoch_acc
 
-    # --------------------------Evaluation--------------------------
-    def evaluate(self):
+    # ── Evaluation ────────────────────────────────────────────────────
+    def _evaluate(self):
+        """
+        Standard accuracy evaluation on test set.
+        No attack or defense involved — pure classification performance.
+        """
         self.client_model.eval()
         self.server_model.eval()
 
@@ -172,75 +162,156 @@ class SplitLearningTrainer:
 
         with torch.no_grad():
             for inputs, labels in self.test_loader:
-                inputs = inputs.to(self.device)
-                labels = labels.to(self.device)
-
-                smashed_data = self.client_model(inputs)
-                outputs      = self.server_model(smashed_data)
-
+                inputs  = inputs.to(self.device)
+                labels  = labels.to(self.device)
+                smashed = self.client_model(inputs)
+                outputs = self.server_model(smashed)
                 _, predicted = outputs.max(1)
-                total       += labels.size(0)
-                correct     += predicted.eq(labels).sum().item()
+                total   += labels.size(0)
+                correct += predicted.eq(labels).sum().item()
 
         test_acc = 100. * correct / total
         self.test_accuracies.append(test_acc)
         return test_acc
 
-    # -----------------------Full training loop-------------------------------
+    # ── Full training loop ────────────────────────────────────────────
     def train(self):
+        """
+        Runs the full training loop for Config.EPOCHS epochs.
+        Saves best checkpoint automatically.
+        Returns metric histories for plotting.
+        """
         print("\n" + "="*60)
         print("   VANILLA SPLIT LEARNING — TRAINING START")
         print("="*60)
-        print(f"  Dataset  : {Config.DATASET}")
-        print(f"  Epochs   : {Config.EPOCHS}")
-        print(f"  LR       : {Config.LEARNING_RATE}")
-        print(f"  Cut Layer: {Config.CUT_LAYER}")
+        print(f"  Dataset    : {Config.DATASET}")
+        print(f"  Epochs     : {Config.EPOCHS}")
+        print(f"  LR         : {Config.LEARNING_RATE}")
+        print(f"  Cut Layer  : {Config.CUT_LAYER}")
+        print(f"  Batch Size : {Config.BATCH_SIZE}")
         print("="*60 + "\n")
 
         best_acc = 0.0
 
         for epoch in range(Config.EPOCHS):
-            train_loss, train_acc = self.train_one_epoch(epoch)
-            test_acc              = self.evaluate()
+            train_loss, train_acc = self._train_one_epoch(epoch)
+            test_acc              = self._evaluate()
 
-            # Step schedulers
+            # Step schedulers based on test accuracy
             self.client_scheduler.step(test_acc)
             self.server_scheduler.step(test_acc)
 
             print(
-                f"Epoch {epoch+1:3d}/{Config.EPOCHS} | "
+                f"  Epoch {epoch+1:3d}/{Config.EPOCHS} | "
                 f"Loss: {train_loss:.4f} | "
-                f"Train Acc: {train_acc:.2f}% | "
-                f"Test Acc: {test_acc:.2f}%"
+                f"Train: {train_acc:.2f}% | "
+                f"Test: {test_acc:.2f}%"
             )
 
-            # Save best model checkpoint
+            # Save checkpoint when test accuracy improves
             if test_acc > best_acc:
                 best_acc = test_acc
-                torch.save({
-                    'epoch'       : epoch,
-                    'client_state': self.client_model.state_dict(),
-                    'server_state': self.server_model.state_dict(),
-                    'best_acc'    : best_acc,
-                    'config'      : {
-                        'dataset'   : Config.DATASET,
-                        'cut_layer' : Config.CUT_LAYER,
-                        'lr'        : Config.LEARNING_RATE
-                    }
-                }, f"{Config.SAVE_DIR}/best_vanilla_sl_{Config.DATASET}.pth")
+                self._save_checkpoint(epoch, best_acc)
 
-        print(f"\nTraining complete. Best Test Accuracy: {best_acc:.2f}%")
+        print(f"\n  Training complete. Best Test Accuracy: {best_acc:.2f}%")
         return self.train_losses, self.train_accuracies, self.test_accuracies
 
-    # --------------------------Save CSV results---------------------------------
+    # ── Checkpoint save ───────────────────────────────────────────────
+    def _save_checkpoint(self, epoch, best_acc):
+        """
+        Saves both client and server model states.
+        Includes dataset name so attack knows which normalization to use.
+        Filename includes dataset name to prevent CIFAR-10 and MNIST
+        checkpoints overwriting each other.
+        """
+        save_path = f"{Config.SAVE_DIR}/best_vanilla_sl_{Config.DATASET}.pth"
+        torch.save({
+            'epoch'        : epoch,
+            'client_state' : self.client_model.state_dict(),
+            'server_state' : self.server_model.state_dict(),
+            'best_acc'     : best_acc,
+            'dataset'      : Config.DATASET,
+            'cut_layer'    : Config.CUT_LAYER,
+            'lr'           : Config.LEARNING_RATE
+        }, save_path)
+
+    # ── Smashed data extraction — used by attack ──────────────────────
+    def get_smashed_data(self, inputs):
+        """
+        Exposes intermediate smashed data from the client model.
+        This is what the server receives during normal SL operation
+        and what the attacker intercepts during a model inversion attack.
+
+        Used by WhiteBoxInversionAttack in attacks.py:
+            smashed = trainer.get_smashed_data(inputs)
+            reconstructed = attacker.reconstruct(smashed, inputs.shape)
+
+        Can also be called directly on client_model:
+            smashed = client_model(inputs)   ← equivalent, simpler
+
+        inputs: [batch, C, H, W] — normalized image batch on correct device
+        returns: [batch, C_smash, H_smash, W_smash] — smashed data tensor
+        """
+        self.client_model.eval()
+        with torch.no_grad():
+            return self.client_model(inputs)
+
+    # ── Accuracy with defense — used by defense evaluation ────────────
+    def evaluate_with_defense(self, defense_fn):
+        """
+        Measures classification accuracy when a defense is applied
+        to smashed data before it reaches the server.
+
+        defense_fn: callable that takes smashed data tensor and returns
+                    a perturbed version of the same shape.
+                    Example: pgsl_defense.protect or dpsl_defense.protect
+
+        Used during defense evaluation to measure accuracy cost:
+            baseline_acc = trainer.evaluate_with_defense(lambda x: x)
+            pgsl_acc     = trainer.evaluate_with_defense(pgsl.protect)
+            dpsl_acc     = trainer.evaluate_with_defense(dpsl.protect)
+
+        Returns accuracy as float percentage.
+        """
+        self.client_model.eval()
+        self.server_model.eval()
+
+        correct = 0
+        total   = 0
+
+        with torch.no_grad():
+            for inputs, labels in self.test_loader:
+                inputs  = inputs.to(self.device)
+                labels  = labels.to(self.device)
+
+                # Get smashed data
+                smashed = self.client_model(inputs)
+
+                # Apply defense — server only sees protected version
+                smashed_protected = defense_fn(smashed)
+
+                # Server classifies from protected smashed data
+                outputs = self.server_model(smashed_protected)
+                _, predicted = outputs.max(1)
+                total   += labels.size(0)
+                correct += predicted.eq(labels).sum().item()
+
+        return 100.0 * correct / total
+
+    # ── Save results CSV ──────────────────────────────────────────────
     def save_results(self):
+        """
+        Saves epoch-by-epoch training metrics to CSV.
+        Filename includes dataset name so CIFAR-10 and MNIST results
+        coexist without overwriting.
+        Used by compare_datasets.py for side-by-side comparison plots.
+        """
         df = pd.DataFrame({
-            'epoch'          : range(1, len(self.train_losses) + 1),
-            'train_loss'     : self.train_losses,
-            'train_accuracy' : self.train_accuracies,
-            'test_accuracy'  : self.test_accuracies
+            'epoch'         : range(1, len(self.train_losses) + 1),
+            'train_loss'    : self.train_losses,
+            'train_accuracy': self.train_accuracies,
+            'test_accuracy' : self.test_accuracies
         })
-        # dataset name included in filename
         path = f"{Config.RESULTS_DIR}/vanilla_sl_results_{Config.DATASET}.csv"
         df.to_csv(path, index=False)
-        print(f"Results saved → {path}")
+        print(f"  Results saved → {path}")

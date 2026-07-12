@@ -4,7 +4,7 @@
 class Config:
 
     # ----------------------Dataset--------------------------
-    DATASET       = 'CIFAR10'   # Switch to 'MNIST'/'CIFAR10' anytime 
+    DATASET       = 'MNIST'   # Switch to 'MNIST'/'CIFAR10' anytime 
     DATA_DIR      = './data'
     NUM_CLASSES   = 10
 
@@ -17,7 +17,7 @@ class Config:
     # CUT_LAYER = 2 means client runs Conv1 + Conv2
     # Server runs Conv3 + FC layers
     # You will change this value during heterogeneous setup
-    CUT_LAYER     = 2
+    CUT_LAYER     = 2#might change later
 
     # ----------------------Device--------------------------
     DEVICE        = 'cuda'      # Automatically falls back to cpu if cuda unavailable

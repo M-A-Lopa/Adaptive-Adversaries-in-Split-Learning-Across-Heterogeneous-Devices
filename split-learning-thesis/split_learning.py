@@ -15,6 +15,7 @@ import torch.optim as optim
 from tqdm import tqdm
 import pandas as pd
 from config import Config
+from all_defences.pgsl_defense import AdaptiveWeightedDecisionFusion, PGSLDefenseModules
 
 
 class SplitLearningTrainer:
@@ -35,20 +36,12 @@ class SplitLearningTrainer:
         self.test_loader  = test_loader
 
         # Separate optimizers — simulates client and server updating independently
-        self.client_optimizer = optim.Adam(
-            self.client_model.parameters(), lr=Config.LEARNING_RATE
-        )
-        self.server_optimizer = optim.Adam(
-            self.server_model.parameters(), lr=Config.LEARNING_RATE
-        )
+        self.client_optimizer = optim.Adam(self.client_model.parameters(), lr=Config.LEARNING_RATE)
+        self.server_optimizer = optim.Adam( self.server_model.parameters(), lr=Config.LEARNING_RATE)
 
         # Learning rate scheduler — reduces LR when accuracy plateaus
-        self.client_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.client_optimizer, patience=5, factor=0.5, verbose=True
-        )
-        self.server_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.server_optimizer, patience=5, factor=0.5, verbose=True
-        )
+        self.client_scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.client_optimizer, patience=5, factor=0.5, verbose=True)
+        self.server_scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.server_optimizer, patience=5, factor=0.5, verbose=True)
 
         self.criterion = nn.CrossEntropyLoss()
 
@@ -79,38 +72,85 @@ class SplitLearningTrainer:
             inputs = inputs.to(self.device)
             labels = labels.to(self.device)
 
-            # --------------------------CLIENT FORWARD PASS--------------------------
+            # =========================================================================
+            # PHASE 1: Connected Baseline Pass (Graph Intact for Jacobian Calculation)
+            # =========================================================================
+            inputs.requires_grad_(True)
+            
+            # Downsample the raw unperturbed image with the empty tracking placeholder channel
+            baseline_tensor = PGSLDefenseModules.space_to_depth_downsample(inputs, saliency_map=None)
+            
+            # Forward pass with autograd ACTIVE so the graph links inputs -> s_baseline -> baseline_logits
+            s_baseline = self.client_model(baseline_tensor)
+            
+            # Fast evaluation pass through the server's attacked stream head
+            baseline_logits, _, _ = self.server_model(s_baseline, run_full_pipeline=False)
+
+            # =========================================================================
+            # PHASE 2: True Saliency Generation, Disconnection, and Defensive Training
+            # =========================================================================
+            # Generate the faithful quantitative reversed JSMA map using the active graph
+            x_perturbed, map_tensor = PGSLDefenseModules.generate_faithful_saliency_map(
+                inputs=inputs,
+                baseline_logits=baseline_logits,
+                num_classes=Config.NUM_CLASSES
+            )
+
+            # Crucial Step: Clear the active optimization gradients across both modules 
+            # to completely wipe any intermediate tracking artifacts from the Phase 1 Jacobian computation
             self.client_optimizer.zero_grad()
-            smashed_data = self.client_model(inputs)
-            # smashed_data shape: [batch, 32, 8, 8] for CIFAR-10
-
-            # Detach from client graph before sending to server
-            # requires_grad=True allows gradient to flow back to client
-            smashed_data_server = smashed_data.detach().requires_grad_(True)
-
-            # --------------------------SERVER FORWARD PASS--------------------------
             self.server_optimizer.zero_grad()
-            outputs = self.server_model(smashed_data_server)
-            loss    = self.criterion(outputs, labels)
 
-            # --------------------------SERVER BACKWARD PASS--------------------------
-            loss.backward()
+            # Construct the true 4ch + 1 active tensor layout using the newly generated maps
+            client_tensor = PGSLDefenseModules.space_to_depth_downsample(x_perturbed, map_tensor)
+
+            # Forward Pass to create actual training intermediate activations
+            s_client_output = self.client_model(client_tensor)
+
+            # --- TRUE GRADIENT TRANSMISSION ISOLATION ---
+            # Detach to create an explicit server-side leaf node, cutting graph communication back to the client
+            s_server_leaf = s_client_output.detach().requires_grad_(True)
+
+            # Process through the server's separate backbones
+            out_a, out_r, out_f = self.server_model(s_server_leaf, run_full_pipeline=True)
+
+            # Compute the three distinct structural losses
+            loss_a = self.criterion(out_a, labels)
+            loss_r = self.criterion(out_r, labels)
+            loss_f = self.criterion(out_f, labels)
+
+            # 1. Backpropagate Attacked and Recovered losses. Gradients accumulate on server 
+            # parameters, and their impact over s_server_leaf is calculated but trapped there.
+            loss_a.backward(retain_graph=True)
+            loss_r.backward(retain_graph=True)
+
+            # Zero out any mixed leaf gradients accumulated on s_server_leaf from streams A and R
+            s_server_leaf.grad.zero_()
+
+            # 2. Backpropagate Fused stream loss. 
+            loss_f.backward() 
+
+            # Extract the true, unpolluted gradient generated EXCLUSIVELY by the fused stream
+            fused_gradient_only = s_server_leaf.grad
+
+            # 3. Manually pass this clean gradient block back to the client graph
+            s_client_output.backward(gradient=fused_gradient_only)
+
+            # Complete structural optimization parameter update steps
             self.server_optimizer.step()
-
-            # --------------------------CLIENT BACKWARD PASS--------------------------
-            # smashed_data_server.grad is the gradient the server
-            # computed w.r.t. smashed data — this is sent back to client
-            smashed_data.backward(smashed_data_server.grad)
             self.client_optimizer.step()
 
+            # Adaptive Late Decision Fusion logic for metric tracking and evaluation
+            final_logits = AdaptiveWeightedDecisionFusion.fuse_outputs(out_a, out_r, out_f)
+
             # --------------------------Track metrics--------------------------
-            running_loss += loss.item()
-            _, predicted  = outputs.max(1)
+            running_loss += loss_f.item()  # Tracking the main defensive fusion loss
+            _, predicted  = final_logits.max(1)
             total        += labels.size(0)
             correct      += predicted.eq(labels).sum().item()
 
             progress_bar.set_postfix({
-                'Loss': f'{loss.item():.4f}',
+                'Loss': f'{loss_f.item():.4f}',
                 'Acc' : f'{100.*correct/total:.2f}%'
             })
 

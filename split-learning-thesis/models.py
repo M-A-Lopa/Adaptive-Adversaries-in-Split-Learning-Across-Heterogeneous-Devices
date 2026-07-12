@@ -1,15 +1,20 @@
+# models.py
 # Defines client-side and server-side sub-models for Vanilla Split Learning
 #
 # Architecture (CIFAR-10):
 # Client: Conv1 → Conv2 → [smashed data sent to server]
 # Server: Conv3 → AdaptivePool → FC1 → FC2 → Output
+#
+# Smashed data shape after client: [batch, 32, 8, 8]
+# AdaptiveAvgPool2d on server maps any smashed data size to fixed 4x4
+# This prepares the server to handle heterogeneous clients later
 
 
 import torch.nn as nn
 
 
 class ClientModel(nn.Module):
-    
+
     def __init__(self, in_channels=3):
         super(ClientModel, self).__init__()
 
@@ -40,11 +45,6 @@ class ClientModel(nn.Module):
 
 
 class ServerModel(nn.Module):
-    """
-    AdaptiveAvgPool2d maps ANY smashed data spatial size to fixed 4x4.
-    This means the server handles different client cut depths automatically.
-    Critical for heterogeneous setup in Week 9-11.
-    """
 
     def __init__(self, num_classes=10):
         super(ServerModel, self).__init__()

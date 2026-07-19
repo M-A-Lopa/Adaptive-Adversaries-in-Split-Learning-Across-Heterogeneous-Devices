@@ -81,14 +81,14 @@ class DatasetLoader:
             train_data,
             batch_size=Config.BATCH_SIZE,
             shuffle=True,
-            num_workers=2,
+            num_workers=0,
             pin_memory=True        # speeds up GPU transfer
         )
         self.test_loader = DataLoader(
             test_data,
             batch_size=Config.BATCH_SIZE,
             shuffle=False,
-            num_workers=2,
+            num_workers=0,
             pin_memory=True
         )
 

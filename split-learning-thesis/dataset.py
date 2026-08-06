@@ -6,10 +6,6 @@ from config import Config
 
 
 class DatasetLoader:
-    """
-    Loads and preprocesses CIFAR-10 or MNIST.
-    Automatically downloads dataset to Config.DATA_DIR on first run.
-    """
 
     def __init__(self, dataset_name=Config.DATASET):
         self.dataset_name = dataset_name
@@ -55,6 +51,7 @@ class DatasetLoader:
 
     # -------------------------Load dataset--------------------------
     def _load(self):
+
         train_transform, test_transform = self._get_transforms()
 
         if self.dataset_name == 'CIFAR10':
@@ -98,4 +95,5 @@ class DatasetLoader:
         print(f"Batch size  : {Config.BATCH_SIZE}")
 
     def get_loaders(self):
+        
         return self.train_loader, self.test_loader

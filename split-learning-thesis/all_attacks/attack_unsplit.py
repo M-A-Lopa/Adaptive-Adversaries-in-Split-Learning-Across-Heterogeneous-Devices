@@ -1,16 +1,4 @@
-# attack_unsplit.py
-#
-# Key difference from simple inverter attacks:
-# UnSplit is DATA-OBLIVIOUS — the server needs NO auxiliary dataset.
-# It only needs knowledge of the client architecture (not the weights).
-#
-# Attack mechanism (coordinate gradient descent):
-# Step A — Model Stealing: fix x̃, optimize clone θ̃ to match smashed data
-# Step B — Model Inversion: fix θ̃, optimize x̃ to match smashed data output
-# Repeat A and B alternately for each batch.
-#
-# Objective: x̃* = argmin MSE(f̃₁(θ̃₁, x̃), f₁(θ₁, x)) + λ·TV(x̃)
-# where TV is Total Variation regularization for image smoothness.
+
 
 
 import os
@@ -26,14 +14,6 @@ from config import Config
 
 # ── Total Variation Regularizer ───────────────────────────────────────
 def total_variation(x):
-    """
-    Anisotropic Total Variation for 2D images.
-    Penalizes pixel differences between neighboring pixels.
-    Encourages reconstructed image to be smooth (less noisy).
-    Identical to TV used in the UnSplit paper.
-
-    x shape: [batch, channels, height, width]
-    """
     diff_h = torch.abs(x[:, :, 1:, :] - x[:, :, :-1, :])
     diff_w = torch.abs(x[:, :, :, 1:] - x[:, :, :, :-1])
     return diff_h.mean() + diff_w.mean()
@@ -49,41 +29,15 @@ def denormalize(tensor, dataset='CIFAR10'):
         std  = torch.tensor([0.3081]).view(1, 1, 1).to(tensor.device)
     return torch.clamp(tensor * std + mean, 0.0, 1.0)
 
-
-# Shared evaluation metrics used by both attack and defense evaluations
-#
-# Metrics used in both PGSL and DP-SL papers:
-# - MSE        : Mean Squared Error between original and reconstructed image
-# - PSNR       : Peak Signal-to-Noise Ratio (dB) — primary reconstruction metric
-# - SSIM       : Structural Similarity Index — structural fidelity metric
-# - Accuracy   : Classification accuracy — measures defense utility cost
-# - Acc Drop   : How much accuracy falls after applying defense
-
 import torch
 import numpy as np
 
 
 def compute_mse(original, reconstructed):
-    """
-    Mean Squared Error between original and reconstructed image.
-    Lower MSE = better reconstruction = stronger attack.
-    Used as primary loss in UnSplit attack optimization.
-    """
     return torch.mean((original - reconstructed) ** 2).item()
 
 
 def compute_psnr(original, reconstructed):
-    """
-    Peak Signal-to-Noise Ratio in dB.
-    Higher PSNR = better reconstruction = stronger attack.
-    Lower PSNR after defense = defense working.
-
-    Reference values:
-    > 30 dB : High quality reconstruction (attack very strong)
-    20-30 dB: Recognizable reconstruction (attack strong)
-    10-20 dB: Degraded but partial reconstruction (attack moderate)
-    < 10 dB : Poor reconstruction (defense effective)
-    """
     mse = torch.mean((original - reconstructed) ** 2)
     if mse == 0:
         return float('inf')
@@ -91,19 +45,6 @@ def compute_psnr(original, reconstructed):
 
 
 def compute_ssim(original, reconstructed):
-    """
-    Structural Similarity Index. Range: [0, 1].
-    Higher SSIM = more structurally similar = stronger attack.
-    Lower SSIM after defense = defense working.
-
-    Used in PGSL paper as secondary reconstruction quality metric.
-
-    Reference values:
-    > 0.8 : High structural similarity (attack very strong)
-    0.5-0.8: Moderate structural similarity (attack strong)
-    0.2-0.5: Low structural similarity (defense effective)
-    < 0.2 : Near-random (defense very effective)
-    """
     if original.dim() == 4:
         # Batch mode — average across batch
         scores = [_ssim_single(original[i], reconstructed[i])
@@ -113,7 +54,6 @@ def compute_ssim(original, reconstructed):
 
 
 def _ssim_single(x, y):
-    """SSIM for a single image tensor [C, H, W]."""
     C1, C2 = 0.01 ** 2, 0.03 ** 2
     mu_x    = x.mean().item()
     mu_y    = y.mean().item()
@@ -127,10 +67,6 @@ def _ssim_single(x, y):
 
 
 def compute_accuracy(model_client, model_server, data_loader, device):
-    """
-    Classification accuracy of the SL pipeline on a data loader.
-    Used to measure utility cost of each defense.
-    """
     model_client.eval()
     model_server.eval()
     correct = 0
@@ -151,10 +87,6 @@ def compute_accuracy(model_client, model_server, data_loader, device):
 
 def compute_accuracy_with_defense(model_client, model_server,
                                    defense_fn, data_loader, device):
-    """
-    Classification accuracy when defense is applied to smashed data.
-    defense_fn: callable that takes smashed_data tensor and returns perturbed tensor
-    """
     model_client.eval()
     model_server.eval()
     correct = 0
@@ -178,14 +110,6 @@ def compute_accuracy_with_defense(model_client, model_server,
 
 
 def print_metrics_table(results: dict):
-    """
-    Prints a formatted comparison table.
-    results = {
-        'No Defense'  : {'mse': x, 'psnr': x, 'ssim': x, 'accuracy': x},
-        'PGSL'        : {'mse': x, 'psnr': x, 'ssim': x, 'accuracy': x},
-        'DP-SL'       : {'mse': x, 'psnr': x, 'ssim': x, 'accuracy': x},
-    }
-    """
     header = f"\n{'Method':<20} {'MSE':>10} {'PSNR (dB)':>12} {'SSIM':>10} {'Accuracy':>12}"
     print("\n" + "=" * 68)
     print("   DEFENSE COMPARISON TABLE")
@@ -203,19 +127,6 @@ def print_metrics_table(results: dict):
 
 # ── UnSplit Attack ────────────────────────────────────────────────────
 class UnSplitAttack:
-    """
-    Implements the UnSplit model inversion attack.
-
-    The server maintains a clone of the client architecture and
-    alternates between two optimization steps per batch:
-      (A) Model stealing: update clone weights to match smashed data
-      (B) Model inversion: optimize dummy input to match smashed data
-
-    This requires NO auxiliary data — only knowledge of client architecture.
-    This is what makes UnSplit fundamentally more dangerous than
-    inverter-network attacks that need training data.
-    """
-
     def __init__(self, client_model, in_channels=3):
         self.device = torch.device(
             Config.DEVICE if torch.cuda.is_available() else 'cpu'
@@ -227,7 +138,7 @@ class UnSplitAttack:
 
         # Clone model — same architecture, different (randomly initialized) weights
         # The server owns this and updates it during the attack
-        from models import ClientModel
+        from all_model.models import ClientModel
         self.clone_model = ClientModel(in_channels=in_channels).to(self.device)
 
         # TV regularization strength — from UnSplit paper recommendation
@@ -254,52 +165,29 @@ class UnSplitAttack:
 
     def _reconstruct_batch(self, smashed_data, input_shape,
                             inversion_steps=300, lr_input=0.1):
-        """
-        Reconstructs a single batch of inputs from their smashed data.
-
-        Step A: Update clone weights (model stealing)
-        Step B: Optimize dummy input (model inversion)
-
-        input_shape: shape of one input e.g. (3, 32, 32) for CIFAR-10
-        inversion_steps: how many gradient steps for input optimization
-        """
         batch_size = smashed_data.shape[0]
-
-        # ── Step A: Model Stealing ────────────────────────
-        # Update clone to produce same output as victim client on this batch
-        # We do this first so clone matches the current victim state
         self.clone_model.train()
-        for _ in range(10):  # brief clone update per batch
+        for _ in range(10): 
             self.clone_optimizer.zero_grad()
-
-            # We need a dummy input just to run the clone forward pass
-            # shape: [batch, C, H, W]
             dummy = torch.randn(
                 batch_size, *input_shape,
                 device=self.device, requires_grad=False
             )
             clone_smashed = self.clone_model(dummy)
 
-            # The clone should produce smashed data of same shape and distribution
-            # Use MSE on statistics (mean, std) since we cannot access victim input
             loss_steal = (
                 self.mse_loss(clone_smashed.mean(dim=0), smashed_data.mean(dim=0)) +
                 self.mse_loss(clone_smashed.std(dim=0),  smashed_data.std(dim=0))
             )
             loss_steal.backward()
             self.clone_optimizer.step()
-
-        # ── Step B: Model Inversion ───────────────────────
-        # Freeze clone, optimize dummy input to match target smashed data
         self.clone_model.eval()
 
-        # Initialize dummy input — uniform random in [0, 1]
         dummy_input = torch.rand(
             batch_size, *input_shape,
             device=self.device
         ).requires_grad_(True)
 
-        # Adam optimizer for the input pixels
         input_optimizer = optim.Adam([dummy_input], lr=lr_input)
 
         best_loss    = float('inf')
@@ -308,7 +196,6 @@ class UnSplitAttack:
         for step in range(inversion_steps):
             input_optimizer.zero_grad()
 
-            # Run dummy input through clone model
             clone_output = self.clone_model(dummy_input)
 
             # MSE between clone output and actual smashed data
@@ -333,10 +220,6 @@ class UnSplitAttack:
 
     def run_attack(self, data_loader, num_batches=20,
                    inversion_steps=300):
-        """
-        Runs UnSplit attack over multiple batches.
-        Returns aggregated PSNR, SSIM, MSE metrics.
-        """
         print(f"\n  Running UnSplit attack on {num_batches} batches...")
         print(f"  Inversion steps per batch: {inversion_steps}")
 
@@ -417,10 +300,6 @@ class UnSplitAttack:
     def run_attack_with_defense(self, data_loader, defense_fn,
                                  defense_name, num_batches=20,
                                  inversion_steps=300):
-        """
-        Runs UnSplit attack but smashed data is first passed through defense_fn.
-        defense_fn: callable that perturbs smashed data before attacker sees it.
-        """
         print(f"\n  Running UnSplit attack WITH defense: {defense_name}")
 
         in_channels = 1 if Config.DATASET == 'MNIST' else 3
@@ -489,10 +368,6 @@ class UnSplitAttack:
         }
 
     def _save_visualization(self, originals, reconstructed, tag='result'):
-        """
-        Side-by-side: original (top row) vs reconstructed (bottom row).
-        Saved for thesis figure.
-        """
         num = min(8, len(originals))
         fig = plt.figure(figsize=(num * 2, 5))
         gs  = gridspec.GridSpec(2, num, hspace=0.3)

@@ -24,7 +24,3 @@ pandas==2.2.2
 
 # ── Training utilities ────────────────────────────────
 tqdm==4.66.4
-
-# ── Jupyter (optional) ────────────────────────────────
-# ipykernel==6.29.4
-# jupyter==1.0.0

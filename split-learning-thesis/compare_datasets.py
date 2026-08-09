@@ -82,13 +82,13 @@ def plot_comparison(df_cifar, df_mnist):
     fig = plt.figure(figsize=(16, 11))
     gs  = gridspec.GridSpec(2, 2, hspace=0.38, wspace=0.32)
 
-    # -------------------------- Color scheme --------------------------
+    
     COLOR_CIFAR_TRAIN = '#1f77b4'   # Blue
     COLOR_CIFAR_TEST  = '#aec7e8'   # Light blue
     COLOR_MNIST_TRAIN = '#d62728'   # Red
     COLOR_MNIST_TEST  = '#ffbb78'   # Light orange
 
-    # -------------------------- Plot 1: Training Loss --------------------------
+    
     ax1 = fig.add_subplot(gs[0, 0])
     ax1.plot(epochs_c, df_cifar['train_loss'],
              color=COLOR_CIFAR_TRAIN, linewidth=2, label='CIFAR-10')
@@ -112,7 +112,7 @@ def plot_comparison(df_cifar, df_mnist):
     ax2.legend(fontsize=10)
     ax2.grid(True, alpha=0.3)
 
-    # -------------------------- Plot 3: Train Accuracy --------------------------
+    # -------------------------- Train Accuracy --------------------------
     ax3 = fig.add_subplot(gs[1, 0])
     ax3.plot(epochs_c, df_cifar['train_accuracy'],
              color=COLOR_CIFAR_TRAIN, linewidth=2, label='CIFAR-10 Train')

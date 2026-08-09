@@ -22,21 +22,11 @@ from config import Config
 
 
 class SplitLearningTrainer:
-    """
-    Trains client and server models using Vanilla Split Learning protocol.
-    Simulates two-party communication via smashed data and gradient exchange.
-
-    After training, the client model can be passed directly to
-    WhiteBoxInversionAttack — the attack calls client_model(inputs)
-    to obtain smashed data without needing any changes here.
-    """
 
     def __init__(self, client_model, server_model,
                  train_loader, test_loader):
 
-        self.device = torch.device(
-            Config.DEVICE if torch.cuda.is_available() else 'cpu'
-        )
+        self.device = torch.device(Config.DEVICE if torch.cuda.is_available() else 'cpu')
         print(f"  Device: {self.device}")
 
         # Move models to device
@@ -48,22 +38,13 @@ class SplitLearningTrainer:
 
         # Separate optimizers — simulates client and server
         # updating their own weights independently
-        self.client_optimizer = optim.Adam(
-            self.client_model.parameters(),
-            lr=Config.LEARNING_RATE
-        )
-        self.server_optimizer = optim.Adam(
-            self.server_model.parameters(),
-            lr=Config.LEARNING_RATE
-        )
+        self.client_optimizer = optim.Adam(self.client_model.parameters(),lr=Config.LEARNING_RATE)
+        self.server_optimizer = optim.Adam(self.server_model.parameters(),lr=Config.LEARNING_RATE
+)
 
         # Reduce LR when accuracy plateaus — prevents overfitting
-        self.client_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.client_optimizer, patience=5, factor=0.5
-        )
-        self.server_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.server_optimizer, patience=5, factor=0.5
-        )
+        self.client_scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.client_optimizer, patience=5, factor=0.5)
+        self.server_scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.server_optimizer, patience=5, factor=0.5)
 
         self.criterion = nn.CrossEntropyLoss()
 
@@ -77,14 +58,7 @@ class SplitLearningTrainer:
 
     # ── Single epoch training ─────────────────────────────────────────
     def _train_one_epoch(self, epoch):
-        """
-        Runs one full training epoch using the SL communication protocol.
 
-        The detach + requires_grad trick simulates network communication:
-        - smashed_data_server is what the server actually receives
-        - its .grad after server backward = the gradient message sent back
-        - client uses that gradient to update its own layers
-        """
         self.client_model.train()
         self.server_model.train()
 
@@ -92,11 +66,7 @@ class SplitLearningTrainer:
         correct      = 0
         total        = 0
 
-        progress_bar = tqdm(
-            self.train_loader,
-            desc=f"  Epoch [{epoch+1}/{Config.EPOCHS}]",
-            leave=False
-        )
+        progress_bar = tqdm(self.train_loader, desc=f"  Epoch [{epoch+1}/{Config.EPOCHS}]", leave=False)
 
         for inputs, labels in progress_bar:
             inputs = inputs.to(self.device)
@@ -150,10 +120,7 @@ class SplitLearningTrainer:
 
     # ── Evaluation ────────────────────────────────────────────────────
     def _evaluate(self):
-        """
-        Standard accuracy evaluation on test set.
-        No attack or defense involved — pure classification performance.
-        """
+
         self.client_model.eval()
         self.server_model.eval()
 
@@ -176,11 +143,7 @@ class SplitLearningTrainer:
 
     # ── Full training loop ────────────────────────────────────────────
     def train(self):
-        """
-        Runs the full training loop for Config.EPOCHS epochs.
-        Saves best checkpoint automatically.
-        Returns metric histories for plotting.
-        """
+
         print("\n" + "="*60)
         print("   VANILLA SPLIT LEARNING — TRAINING START")
         print("="*60)
@@ -218,12 +181,7 @@ class SplitLearningTrainer:
 
     # ── Checkpoint save ───────────────────────────────────────────────
     def _save_checkpoint(self, epoch, best_acc):
-        """
-        Saves both client and server model states.
-        Includes dataset name so attack knows which normalization to use.
-        Filename includes dataset name to prevent CIFAR-10 and MNIST
-        checkpoints overwriting each other.
-        """
+
         save_path = f"{Config.SAVE_DIR}/best_vanilla_sl_{Config.DATASET}.pth"
         torch.save({
             'epoch'        : epoch,
@@ -237,42 +195,14 @@ class SplitLearningTrainer:
 
     # ── Smashed data extraction — used by attack ──────────────────────
     def get_smashed_data(self, inputs):
-        """
-        Exposes intermediate smashed data from the client model.
-        This is what the server receives during normal SL operation
-        and what the attacker intercepts during a model inversion attack.
 
-        Used by WhiteBoxInversionAttack in attacks.py:
-            smashed = trainer.get_smashed_data(inputs)
-            reconstructed = attacker.reconstruct(smashed, inputs.shape)
-
-        Can also be called directly on client_model:
-            smashed = client_model(inputs)   ← equivalent, simpler
-
-        inputs: [batch, C, H, W] — normalized image batch on correct device
-        returns: [batch, C_smash, H_smash, W_smash] — smashed data tensor
-        """
         self.client_model.eval()
         with torch.no_grad():
             return self.client_model(inputs)
 
     # ── Accuracy with defense — used by defense evaluation ────────────
     def evaluate_with_defense(self, defense_fn):
-        """
-        Measures classification accuracy when a defense is applied
-        to smashed data before it reaches the server.
 
-        defense_fn: callable that takes smashed data tensor and returns
-                    a perturbed version of the same shape.
-                    Example: pgsl_defense.protect or dpsl_defense.protect
-
-        Used during defense evaluation to measure accuracy cost:
-            baseline_acc = trainer.evaluate_with_defense(lambda x: x)
-            pgsl_acc     = trainer.evaluate_with_defense(pgsl.protect)
-            dpsl_acc     = trainer.evaluate_with_defense(dpsl.protect)
-
-        Returns accuracy as float percentage.
-        """
         self.client_model.eval()
         self.server_model.eval()
 
@@ -300,12 +230,7 @@ class SplitLearningTrainer:
 
     # ── Save results CSV ──────────────────────────────────────────────
     def save_results(self):
-        """
-        Saves epoch-by-epoch training metrics to CSV.
-        Filename includes dataset name so CIFAR-10 and MNIST results
-        coexist without overwriting.
-        Used by compare_datasets.py for side-by-side comparison plots.
-        """
+
         df = pd.DataFrame({
             'epoch'         : range(1, len(self.train_losses) + 1),
             'train_loss'    : self.train_losses,

@@ -16,6 +16,7 @@ from all_model.models import ClientModel, ServerModel
 
 
 def plot_results(train_losses, train_accuracies, test_accuracies, dataset_name):
+    
     epochs = range(1, len(train_losses) + 1)
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
 

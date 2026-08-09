@@ -23,15 +23,14 @@ SAVE_PATH    = f'{RESULTS_DIR}/comparison_cifar10_vs_mnist.png'
 
 
 def load_results(path, dataset_name):
-    """Load CSV and validate it exists and has required columns."""
+
     if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"\nERROR: {path} not found.\n"
+        raise FileNotFoundError(f"\nERROR: {path} not found.\n"
             f"Make sure you have run main.py with DATASET='{dataset_name}' "
-            f"and RUN_TRAINING=True before running this script."
-        )
+            f"and RUN_TRAINING=True before running this script.")
     df = pd.read_csv(path)
     required = {'epoch', 'train_loss', 'train_accuracy', 'test_accuracy'}
+
     if not required.issubset(df.columns):
         raise ValueError(f"CSV missing columns. Found: {df.columns.tolist()}")
     print(f"Loaded {dataset_name}: {len(df)} epochs")
@@ -39,7 +38,7 @@ def load_results(path, dataset_name):
 
 
 def print_summary(df_cifar, df_mnist):
-    """Print final epoch metrics for both datasets."""
+
     print("\n" + "=" * 60)
     print("   FINAL RESULTS SUMMARY")
     print("=" * 60)
@@ -71,11 +70,7 @@ def print_summary(df_cifar, df_mnist):
 
 
 def plot_comparison(df_cifar, df_mnist):
-    """
-    Creates a 2x2 comparison figure:
-    Row 1: Training Loss curves | Test Accuracy curves
-    Row 2: Train Accuracy curves | Final accuracy bar chart
-    """
+
     epochs_c = df_cifar['epoch'].values
     epochs_m = df_mnist['epoch'].values
 
@@ -176,11 +171,7 @@ def plot_comparison(df_cifar, df_mnist):
     ax4.grid(True, alpha=0.3, axis='y')
 
     # -------------------------- Main title --------------------------
-    plt.suptitle(
-        'Vanilla Split Learning — CIFAR-10 vs MNIST Comparison\n'
-        'Simple CNN | Cut Layer 2 | 50 Epochs',
-        fontsize=14, fontweight='bold', y=1.01
-    )
+    plt.suptitle('Vanilla Split Learning — CIFAR-10 vs MNIST Comparison\n''Simple CNN | Cut Layer 2 | 50 Epochs',fontsize=14, fontweight='bold', y=1.01)
 
     plt.savefig(SAVE_PATH, dpi=150, bbox_inches='tight')
     plt.show()

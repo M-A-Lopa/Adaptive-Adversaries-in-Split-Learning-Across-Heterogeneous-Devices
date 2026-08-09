@@ -3,10 +3,10 @@ import torch
 import pandas as pd
 from config import Config
 from dataset import DatasetLoader
-from models import ClientModel, ServerModel
-from split_learning import SplitLearningTrainer
+from all_model.models import ClientModel, ServerModel
+from all_split_learning.split_learning import SplitLearningTrainer
 from all_attacks.attacks_whitebox import WhiteBoxInversionAttack, AttackMetricsTracker
-from All_defences.dpsl_defense import DPSLDefense
+from all_defences.dpsl_defense import DPSLDefense
 
 
 # ── Settings you can tune ───────────────────────────────────────────────

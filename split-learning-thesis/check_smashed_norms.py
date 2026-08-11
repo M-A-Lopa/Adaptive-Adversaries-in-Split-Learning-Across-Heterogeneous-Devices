@@ -1,4 +1,3 @@
-# check_smashed_norms.py
 import os
 import torch
 from config import Config

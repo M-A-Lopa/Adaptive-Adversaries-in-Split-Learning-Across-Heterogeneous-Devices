@@ -1,21 +1,9 @@
-# compare_datasets.py
-# Standalone comparison script — run manually only
-# Reads saved CSV results for CIFAR-10 and MNIST and plots side-by-side comparison
-#
-# Run command:
-#   python compare_datasets.py
-#
-# Prerequisites:
-#   ./results/vanilla_sl_results_CIFAR10.csv must exist
-#   ./results/vanilla_sl_results_MNIST.csv   must exist
-
 import os
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import numpy as np
 
-# -------------------------- Config --------------------------
 RESULTS_DIR  = './results'
 CIFAR10_CSV  = f'{RESULTS_DIR}/vanilla_sl_results_CIFAR10.csv'
 MNIST_CSV    = f'{RESULTS_DIR}/vanilla_sl_results_MNIST.csv'
@@ -61,7 +49,7 @@ def print_summary(df_cifar, df_mnist):
         ('Total Epochs',
          len(df_cifar),
          len(df_mnist)),
-    ]
+]
 
     for label, c_val, m_val in metrics:
         print(f"  {label:<28} {c_val:>12.4f} {m_val:>12.4f}")
@@ -78,10 +66,10 @@ def plot_comparison(df_cifar, df_mnist):
     gs  = gridspec.GridSpec(2, 2, hspace=0.38, wspace=0.32)
 
     
-    COLOR_CIFAR_TRAIN = '#1f77b4'   # Blue
-    COLOR_CIFAR_TEST  = '#aec7e8'   # Light blue
-    COLOR_MNIST_TRAIN = '#d62728'   # Red
-    COLOR_MNIST_TEST  = '#ffbb78'   # Light orange
+    COLOR_CIFAR_TRAIN = '#1f77b4'   
+    COLOR_CIFAR_TEST  = '#aec7e8'  
+    COLOR_MNIST_TRAIN = '#d62728'  
+    COLOR_MNIST_TEST  = '#ffbb78'  
 
     
     ax1 = fig.add_subplot(gs[0, 0])
@@ -95,7 +83,6 @@ def plot_comparison(df_cifar, df_mnist):
     ax1.legend(fontsize=10)
     ax1.grid(True, alpha=0.3)
 
-    # -------------------------- Test Accuracy ─────────────────────────────
     ax2 = fig.add_subplot(gs[0, 1])
     ax2.plot(epochs_c, df_cifar['test_accuracy'],
              color=COLOR_CIFAR_TRAIN, linewidth=2, label='CIFAR-10')
@@ -107,7 +94,6 @@ def plot_comparison(df_cifar, df_mnist):
     ax2.legend(fontsize=10)
     ax2.grid(True, alpha=0.3)
 
-    # -------------------------- Train Accuracy --------------------------
     ax3 = fig.add_subplot(gs[1, 0])
     ax3.plot(epochs_c, df_cifar['train_accuracy'],
              color=COLOR_CIFAR_TRAIN, linewidth=2, label='CIFAR-10 Train')
@@ -125,32 +111,18 @@ def plot_comparison(df_cifar, df_mnist):
     ax3.legend(fontsize=9)
     ax3.grid(True, alpha=0.3)
 
-    # --------------------------Final accuracy bar chart --------------------------
     ax4 = fig.add_subplot(gs[1, 1])
 
     categories    = ['Train Acc\n(Final)', 'Test Acc\n(Final)', 'Test Acc\n(Best)']
-    cifar_values  = [
-        df_cifar['train_accuracy'].iloc[-1],
-        df_cifar['test_accuracy'].iloc[-1],
-        df_cifar['test_accuracy'].max()
-    ]
-    mnist_values  = [
-        df_mnist['train_accuracy'].iloc[-1],
-        df_mnist['test_accuracy'].iloc[-1],
-        df_mnist['test_accuracy'].max()
-    ]
+    cifar_values  = [df_cifar['train_accuracy'].iloc[-1], df_cifar['test_accuracy'].iloc[-1], df_cifar['test_accuracy'].max()]
+    mnist_values  = [df_mnist['train_accuracy'].iloc[-1], df_mnist['test_accuracy'].iloc[-1], df_mnist['test_accuracy'].max()]
 
     x      = np.arange(len(categories))
     width  = 0.32
 
-    bars_c = ax4.bar(x - width/2, cifar_values, width,
-                     color=COLOR_CIFAR_TRAIN, label='CIFAR-10',
-                     edgecolor='white', linewidth=0.8)
-    bars_m = ax4.bar(x + width/2, mnist_values, width,
-                     color=COLOR_MNIST_TRAIN, label='MNIST',
-                     edgecolor='white', linewidth=0.8)
+    bars_c = ax4.bar(x - width/2, cifar_values, width, color=COLOR_CIFAR_TRAIN, label='CIFAR-10', edgecolor='white', linewidth=0.8)
+    bars_m = ax4.bar(x + width/2, mnist_values, width, color=COLOR_MNIST_TRAIN, label='MNIST', edgecolor='white', linewidth=0.8)
 
-    # Add value labels on bars
     for bar in bars_c:
         ax4.text(bar.get_x() + bar.get_width() / 2,
                  bar.get_height() + 0.4,
@@ -170,26 +142,20 @@ def plot_comparison(df_cifar, df_mnist):
     ax4.legend(fontsize=10)
     ax4.grid(True, alpha=0.3, axis='y')
 
-    # -------------------------- Main title --------------------------
     plt.suptitle('Vanilla Split Learning — CIFAR-10 vs MNIST Comparison\n''Simple CNN | Cut Layer 2 | 50 Epochs',fontsize=14, fontweight='bold', y=1.01)
 
     plt.savefig(SAVE_PATH, dpi=150, bbox_inches='tight')
     plt.show()
     print(f"\nComparison plot saved → {SAVE_PATH}")
 
-
-# -------------------------- Entry point -----------------------------
 if __name__ == "__main__":
     print("=" * 60)
     print("   DATASET COMPARISON — CIFAR-10 vs MNIST")
     print("=" * 60)
 
-    # Load both result files
     df_cifar = load_results(CIFAR10_CSV, 'CIFAR10')
     df_mnist  = load_results(MNIST_CSV,  'MNIST')
 
-    # Print summary table to terminal
     print_summary(df_cifar, df_mnist)
 
-    # Generate and save comparison plot
     plot_comparison(df_cifar, df_mnist)

@@ -82,6 +82,37 @@ class PyramidCNN(nn.Module):
 
 
 # ─────────────────────────────────────────
+# Shared layer definitions
+# Both Client and Server build their layers from this same
+# list, so channel sizes always line up correctly no matter
+# where the cut happens — no manual channel bookkeeping needed.
+#
+# Each entry: (out_channels, has_maxpool)
+# ─────────────────────────────────────────
+_LAYER_CONFIG = [
+    (32,  False),  # layer1
+    (64,  True),   # layer2
+    (128, True),   # layer3
+    (256, True),   # layer4
+    (512, True),   # layer5 (uses AdaptiveAvgPool2d instead of MaxPool2d)
+]
+
+
+def _build_layer(in_ch, out_ch, use_maxpool, is_last):
+    if is_last:
+        return nn.Sequential(
+            ConvBlock(in_ch, out_ch),
+            nn.AdaptiveAvgPool2d((1, 1))
+        )
+    if use_maxpool:
+        return nn.Sequential(
+            ConvBlock(in_ch, out_ch),
+            nn.MaxPool2d(2, 2)
+        )
+    return ConvBlock(in_ch, out_ch)
+
+
+# ─────────────────────────────────────────
 # Separate Client and Server Models for Split Learning
 # ─────────────────────────────────────────
 
@@ -91,55 +122,54 @@ class PyramidCNN_Client(nn.Module):
     cut_layer=1 → layer1 only
     cut_layer=2 → layer1 + layer2
     cut_layer=3 → layer1 + layer2 + layer3
+    cut_layer=4 → layer1 + layer2 + layer3 + layer4   (current default)
     """
-    def __init__(self, cut_layer=2, in_channels=3):
+    def __init__(self, cut_layer=4, in_channels=3):
         super(PyramidCNN_Client, self).__init__()
+
+        assert 1 <= cut_layer <= len(_LAYER_CONFIG) - 1, \
+            f"cut_layer must be between 1 and {len(_LAYER_CONFIG) - 1}"
 
         self.cut_layer = cut_layer
 
-        self.layer1 = ConvBlock(in_channels, 32)
+        layers = []
+        in_ch = in_channels
+        for i in range(cut_layer):
+            out_ch, use_maxpool = _LAYER_CONFIG[i]
+            layers.append(_build_layer(in_ch, out_ch, use_maxpool, is_last=False))
+            in_ch = out_ch
 
-        self.layer2 = nn.Sequential(
-            ConvBlock(32, 64),
-            nn.MaxPool2d(2, 2)
-        )
-
-        self.layer3 = nn.Sequential(
-            ConvBlock(64, 128),
-            nn.MaxPool2d(2, 2)
-        )
+        self.client_layers = nn.ModuleList(layers)
 
     def forward(self, x):
-        x = self.layer1(x)
-        if self.cut_layer >= 2:
-            x = self.layer2(x)
-        if self.cut_layer >= 3:
-            x = self.layer3(x)
+        for layer in self.client_layers:
+            x = layer(x)
         return x  # this smashed data will be sent to the server
 
 
 class PyramidCNN_Server(nn.Module):
     """
     Runs on the server — receives smashed data from the client and does the rest.
-    The server knows which channel to start from based on cut_layer.
+    The server automatically figures out the correct input channel count
+    based on cut_layer, using the same shared layer config as the client.
     """
-    def __init__(self, cut_layer=2, num_classes=10):
+    def __init__(self, cut_layer=4, num_classes=10):
         super(PyramidCNN_Server, self).__init__()
 
-        # input channel count differs depending on cut_layer
-        in_ch_map = {1: 32, 2: 64, 3: 128}
-        in_ch = in_ch_map[cut_layer]
+        assert 1 <= cut_layer <= len(_LAYER_CONFIG) - 1, \
+            f"cut_layer must be between 1 and {len(_LAYER_CONFIG) - 1}"
+
+        self.cut_layer = cut_layer
+
+        # input channels to the server = output channels of the client's last layer
+        in_ch = _LAYER_CONFIG[cut_layer - 1][0]
 
         layers = []
-
-        if cut_layer <= 1:
-            layers.append(nn.Sequential(ConvBlock(32, 64), nn.MaxPool2d(2, 2)))
-        if cut_layer <= 2:
-            layers.append(nn.Sequential(ConvBlock(in_ch if cut_layer == 2 else 64, 128), nn.MaxPool2d(2, 2)))
-            in_ch = 128
-
-        layers.append(nn.Sequential(ConvBlock(in_ch if cut_layer == 3 else 128, 256), nn.MaxPool2d(2, 2)))
-        layers.append(nn.Sequential(ConvBlock(256, 512), nn.AdaptiveAvgPool2d((1, 1))))
+        for i in range(cut_layer, len(_LAYER_CONFIG)):
+            out_ch, use_maxpool = _LAYER_CONFIG[i]
+            is_last = (i == len(_LAYER_CONFIG) - 1)
+            layers.append(_build_layer(in_ch, out_ch, use_maxpool, is_last))
+            in_ch = out_ch
 
         self.server_layers = nn.Sequential(*layers)
 
@@ -188,6 +218,15 @@ if __name__ == "__main__":
     client3 = PyramidCNN_Client(cut_layer=3)
     smashed3 = client3(dummy_input)
     print(f"✅ Cut Layer 3 Smashed Shape : {smashed3.shape}")  # (4, 128, 8, 8)
+
+    # ── Test 5: Split Model (cut_layer=4) — current default split point ──
+    client4 = PyramidCNN_Client(cut_layer=4)
+    smashed4 = client4(dummy_input)
+    print(f"✅ Cut Layer 4 Smashed Shape : {smashed4.shape}")  # (4, 256, 4, 4)
+
+    server4 = PyramidCNN_Server(cut_layer=4, num_classes=10)
+    server_output = server4(smashed4)
+    print(f"✅ Server Output Shape (cut_layer=4) : {server_output.shape}")  # (4, 10)
 
     print("=" * 50)
     print("All good! PyramidCNN creation complete.")

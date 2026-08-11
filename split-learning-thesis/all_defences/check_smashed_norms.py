@@ -2,7 +2,7 @@ import os
 import torch
 from config import Config
 from dataset import DatasetLoader
-from models import ClientModel
+from all_model.models import ClientModel
 
 device = torch.device(Config.DEVICE if torch.cuda.is_available() else 'cpu')
 

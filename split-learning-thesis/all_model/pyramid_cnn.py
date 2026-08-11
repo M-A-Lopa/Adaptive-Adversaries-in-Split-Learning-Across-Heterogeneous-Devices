@@ -33,7 +33,7 @@ class PyramidCNN(nn.Module):
        
         self.layer2 = nn.Sequential(
             ConvBlock(32, 64),
-            nn.MaxPool2d(kernel_size=2, stride=2)  # image size is halved
+            nn.MaxPool2d(kernel_size=2, stride=2) 
         )
 
        
@@ -100,13 +100,6 @@ def _build_layer(in_ch, out_ch, use_maxpool, is_last):
 
 
 class PyramidCNN_Client(nn.Module):
-    """
-    Runs on the device — how much runs is determined by cut_layer.
-    cut_layer=1 → layer1 only
-    cut_layer=2 → layer1 + layer2
-    cut_layer=3 → layer1 + layer2 + layer3
-    cut_layer=4 → layer1 + layer2 + layer3 + layer4   (current default)
-    """
     def __init__(self, cut_layer=4, in_channels=3):
         super(PyramidCNN_Client, self).__init__()
 
@@ -131,11 +124,6 @@ class PyramidCNN_Client(nn.Module):
 
 
 class PyramidCNN_Server(nn.Module):
-    """
-    Runs on the server — receives smashed data from the client and does the rest.
-    The server automatically figures out the correct input channel count
-    based on cut_layer, using the same shared layer config as the client.
-    """
     def __init__(self, cut_layer=4, num_classes=10):
         super(PyramidCNN_Server, self).__init__()
 

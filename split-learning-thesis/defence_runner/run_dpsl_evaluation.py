@@ -9,18 +9,15 @@ from all_attacks.attacks_whitebox import WhiteBoxInversionAttack, AttackMetricsT
 from all_defences.dpsl_defense import DPSLDefense
 
 
-# ── Settings you can tune ───────────────────────────────────────────────
-EPSILON_VALUES = [10, 50, 100, 200, 500, 1000]   # Realistic range for feature size
+EPSILON_VALUES = [10, 50, 100, 200, 500, 1000]  
 DELTA          = 1e-5
-CLIP_NORM      = 32.0                            # Matches measured MNIST median norm
+CLIP_NORM      = 32.0                     
 
-MAX_IMAGES     = 32                              # Full evaluation run (32 images)
-ITERATIONS     = 1000                            # Full attack optimization steps
-# ─────────────────────────────────────────────────────────────────────────
+MAX_IMAGES     = 32                           
+ITERATIONS     = 1000                           
 
 
 class DummyNoDefense:
-    """Pass-through defense class for evaluating the baseline without defense."""
     def protect(self, x):
         return x
 
@@ -35,14 +32,8 @@ def denormalize(inputs, dataset_name, device):
     return torch.clamp(inputs * std + mean, 0, 1)
 
 
-def run_attack_against_defense(client_model, defense, test_loader, device,
-                                dataset_name, max_images, iterations):
-    attacker = WhiteBoxInversionAttack(
-        client_model=client_model,
-        dataset=dataset_name,
-        iterations=iterations,
-        lr=1e-2
-    )
+def run_attack_against_defense(client_model, defense, test_loader, device, dataset_name, max_images, iterations):
+    attacker = WhiteBoxInversionAttack(client_model=client_model, dataset=dataset_name, iterations=iterations, lr=1e-2)
     tracker = AttackMetricsTracker()
     images_processed = 0
 
@@ -81,22 +72,15 @@ if __name__ == "__main__":
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(
             f"No checkpoint found at {checkpoint_path}. "
-            f"Run 'python main.py' first to train and save a model."
-        )
+            f"Run 'python main.py' first to train and save a model.")
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
     client_model.load_state_dict(checkpoint['client_state'])
     server_model.load_state_dict(checkpoint['server_state'])
     print(f"[✓] Loaded checkpoint: {checkpoint_path}\n")
 
-    trainer = SplitLearningTrainer(
-        client_model=client_model,
-        server_model=server_model,
-        train_loader=train_loader,
-        test_loader=test_loader
-    )
+    trainer = SplitLearningTrainer(client_model=client_model, server_model=server_model, train_loader=train_loader, test_loader=test_loader)
 
-    # ── 1. BASELINE EVALUATION (NO DEFENSE) ──────────────────────────────
     print("="*60)
     print("  BASELINE (NO DEFENSE)")
     print("="*60)
@@ -105,10 +89,7 @@ if __name__ == "__main__":
     print(f"  Accuracy (no defense): {baseline_acc:.2f}%")
 
     print(f"  Running Baseline White-Box Inversion Attack...")
-    baseline_summary = run_attack_against_defense(
-        client_model, no_defense, test_loader, device,
-        Config.DATASET, MAX_IMAGES, ITERATIONS
-    )
+    baseline_summary = run_attack_against_defense(client_model, no_defense, test_loader, device, Config.DATASET, MAX_IMAGES, ITERATIONS)
     print(f"  Baseline PSNR: {baseline_summary['mean_psnr']:.2f} dB")
     print(f"  Baseline SSIM: {baseline_summary['mean_ssim']:.4f}\n")
 
@@ -116,10 +97,8 @@ if __name__ == "__main__":
         "epsilon": "inf (No Defense)",
         "accuracy": baseline_acc,
         "psnr": baseline_summary['mean_psnr'],
-        "ssim": baseline_summary['mean_ssim']
-    }]
+        "ssim": baseline_summary['mean_ssim']}]
 
-    # ── 2. DEFENSE PARAMETER SWEEP ─────────────────────────────────────────
     for eps in EPSILON_VALUES:
         print("="*60)
         print(f"  DP-SL DEFENSE — epsilon = {eps}")
@@ -133,10 +112,7 @@ if __name__ == "__main__":
               f"(drop of {baseline_acc - acc:.2f} points from baseline)")
 
         print(f"  Running White-Box Inversion Attack against defended data...")
-        summary = run_attack_against_defense(
-            client_model, defense, test_loader, device,
-            Config.DATASET, MAX_IMAGES, ITERATIONS
-        )
+        summary = run_attack_against_defense(client_model, defense, test_loader, device, Config.DATASET, MAX_IMAGES, ITERATIONS)
         print(f"  PSNR (privacy, lower=better): {summary['mean_psnr']:.2f} dB")
         print(f"  SSIM (privacy, lower=better): {summary['mean_ssim']:.4f}\n")
 
@@ -144,21 +120,16 @@ if __name__ == "__main__":
             "epsilon": eps,
             "accuracy": acc,
             "psnr": summary['mean_psnr'],
-            "ssim": summary['mean_ssim']
-        })
+            "ssim": summary['mean_ssim']})
 
-    # ── 3. SAVE TO CSV ──────────────────────────────────────────────────────
     df = pd.DataFrame(results)
     os.makedirs(Config.RESULTS_DIR, exist_ok=True)
     output_path = f"{Config.RESULTS_DIR}/dpsl_defense_evaluation_{Config.DATASET}.csv"
     df.to_csv(output_path, index=False)
-
-    # ── 4. CUSTOM FORMATTED PRINT ──────────────────────────────────────────
     base_acc  = results[0]["accuracy"]
     base_psnr = results[0]["psnr"]
     base_ssim = results[0]["ssim"]
 
-    # Pick eps = 200 for Executive Summary
     opt_row = next((r for r in results if r["epsilon"] == 200), results[1])
     eps_val = opt_row["epsilon"]
     dpsl_label = f"DP-SL Defense (eps = {float(eps_val):.1f})"

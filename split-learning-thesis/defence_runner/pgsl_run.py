@@ -1,15 +1,3 @@
-# pgsl_run.py
-# PGSL Experiment Runner — run this file manually
-# Command: python pgsl_run.py
-#
-# This file:
-# 1. Loads vanilla checkpoint and adapts weights to PGSL architecture
-# 2. Trains PGSL model if no PGSL checkpoint exists
-# 3. Evaluates how well the white-box attack works against PGSL defense
-# 4. Compares PGSL vs no-defense reconstruction quality (PSNR/SSIM)
-# 5. Saves all results to ./results/
-
-
 import os
 import torch
 import numpy as np
@@ -25,18 +13,10 @@ from all_defences.pgsl_defense import PGSLDefenseModules, AdaptiveWeightedDecisi
 from all_attacks.attacks_whitebox import WhiteBoxInversionAttack, AttackMetricsTracker
 from all_attacks.ae_decoder_attack import run_ae_decoder_attack, save_ae_attack_visualization
 
-
-# ── Experiment settings ────────────────────────────────────────────────────────
-MAX_IMAGES_ATTACK = 32    # Images to reconstruct for PGSL attack evaluation
-ATTACK_ITERATIONS = 1000  # Gradient steps per image in whitebox attack
-# ──────────────────────────────────────────────────────────────────────────────
+MAX_IMAGES_ATTACK = 32  
+ATTACK_ITERATIONS = 1000 
 
 def pgsl_preprocess_fn(inputs):
-    """
-    Called before passing images to PGSLClientModel.
-    inputs: normalized tensor [B, C, H, W] from DataLoader
-    returns: space_to_depth tensor [B, 4C+1, H/2, W/2] in [0,1]
-    """
     if Config.DATASET == 'CIFAR10':
         mean = torch.tensor([0.4914, 0.4822, 0.4465],
                             device=inputs.device).view(1, 3, 1, 1)
@@ -48,48 +28,27 @@ def pgsl_preprocess_fn(inputs):
         std  = torch.tensor([0.3081],
                             device=inputs.device).view(1, 1, 1, 1)
     denorm = torch.clamp(inputs * std + mean, 0.0, 1.0)
-    return PGSLDefenseModules.space_to_depth_downsample(
-        denorm, saliency_map=None
-    )
     
-    
-    
+    return PGSLDefenseModules.space_to_depth_downsample(denorm, saliency_map=None)
+        
 def adapt_vanilla_weights_to_pgsl(vanilla_ckpt, client_model, server_model, device):
-    """
-    Adapts weights from vanilla SL checkpoint to PGSL model architecture.
-
-    Client adaptation:
-    - Vanilla conv1: [16, C, 3, 3]  (C=1 for MNIST, 3 for CIFAR-10)
-    - PGSL conv1:   [16, 4C+1, 3, 3]
-    - Copy vanilla weights to first C channels, zero-initialize rest
-
-    Server adaptation:
-    - Vanilla conv3 → PGSL stream_a (attacked stream, best match)
-    - Vanilla fc    → PGSL classifier_a
-    - Other streams (r, f) are randomly initialized
-    """
     vanilla_client_state = vanilla_ckpt['client_state']
     vanilla_server_state = vanilla_ckpt['server_state']
 
-    # ── Adapt client weights ───────────────────────────────────────────────────
     pgsl_client_state = client_model.state_dict()
 
-    old_w = vanilla_client_state['conv1.0.weight']  # [16, C, 3, 3]
-    new_w = pgsl_client_state['conv1.0.weight']      # [16, 4C+1, 3, 3]
+    old_w = vanilla_client_state['conv1.0.weight'] 
+    new_w = pgsl_client_state['conv1.0.weight']    
 
     if old_w.shape != new_w.shape:
         print(f"  Inflating conv1 weights: {list(old_w.shape)} → {list(new_w.shape)}")
         inflated = torch.zeros(new_w.shape, device=device)
-        # Copy vanilla channel weights into first C channels
         inflated[:, :old_w.shape[1], :, :] = old_w
-        # Channels C+1 to 4C+1 stay zero-initialized
         vanilla_client_state['conv1.0.weight'] = inflated
 
-    # All other client layers (conv2) have the same shape
     client_model.load_state_dict(vanilla_client_state)
     print("  Client weights adapted and loaded.")
 
-    # ── Adapt server weights ───────────────────────────────────────────────────
     pgsl_server_state = server_model.state_dict()
 
     for stream in ['a', 'r', 'f']:
@@ -119,11 +78,6 @@ def adapt_vanilla_weights_to_pgsl(vanilla_ckpt, client_model, server_model, devi
 
 
 def load_or_train_pgsl(device, train_loader, test_loader):
-    """
-    Loads PGSL checkpoint if it exists.
-    Otherwise adapts vanilla weights and trains from there.
-    Returns initialized client_model and server_model.
-    """
     in_channels  = 1 if Config.DATASET == 'MNIST' else 3
     client_model = PGSLClientModel(original_in_channels=in_channels).to(device)
     server_model = PGSLServerModel(num_classes=Config.NUM_CLASSES).to(device)
@@ -146,41 +100,20 @@ def load_or_train_pgsl(device, train_loader, test_loader):
         adapt_vanilla_weights_to_pgsl(vanilla_ckpt, client_model, server_model, device)
         print("    Starting PGSL training from adapted weights...")
 
-        trainer = PGSLSplitLearningTrainer(
-            client_model=client_model,
-            server_model=server_model,
-            train_loader=train_loader,
-            test_loader=test_loader
-        )
+        trainer = PGSLSplitLearningTrainer( client_model=client_model, server_model=server_model, train_loader=train_loader, test_loader=test_loader)
         trainer.train()
         trainer.save_results()
 
     else:
         print(f"\n[!] No checkpoint found. Training PGSL from scratch...")
-        trainer = PGSLSplitLearningTrainer(
-            client_model=client_model,
-            server_model=server_model,
-            train_loader=train_loader,
-            test_loader=test_loader
-        )
+        trainer = PGSLSplitLearningTrainer(client_model=client_model, server_model=server_model, train_loader=train_loader, test_loader=test_loader)
         trainer.train()
         trainer.save_results()
 
     return client_model, server_model
 
 
-def run_pgsl_attack(attack_type, client_model,
-                    train_loader, test_loader, device):
-    """
-    Unified PGSL attack runner.
-    attack_type: 'whitebox'   — rMSE optimization attack
-                 'ae_decoder' — model-based AE decoder attack (ResSFL protocol)
-
-    Both attacks use pgsl_preprocess_fn to pass inputs through
-    PGSLClientModel correctly (space_to_depth before client forward).
-
-    Returns: summary dict, originals_vis, reconstructed_vis
-    """
+def run_pgsl_attack(attack_type, client_model, train_loader, test_loader, device):
     in_channels = 1 if Config.DATASET == 'MNIST' else 3
 
     if Config.DATASET == 'CIFAR10':
@@ -192,19 +125,12 @@ def run_pgsl_attack(attack_type, client_model,
         mean = torch.tensor([0.1307], device=device).view(1, 1, 1, 1)
         std  = torch.tensor([0.3081], device=device).view(1, 1, 1, 1)
 
-    # ── White-box rMSE attack ─────────────────────────────────────────────────
     if attack_type == 'whitebox':
         print("\n" + "="*60)
         print("  WHITE-BOX ATTACK AGAINST PGSL DEFENSE")
         print("="*60)
 
-        attacker = WhiteBoxInversionAttack(
-            client_model=client_model,
-            dataset=Config.DATASET,
-            iterations=ATTACK_ITERATIONS,
-            lr=1e-2,
-            use_normalization=False  # PGSL input is already in [0,1] space
-        )
+        attacker = WhiteBoxInversionAttack(client_model=client_model, dataset=Config.DATASET, iterations=ATTACK_ITERATIONS, lr=1e-2, use_normalization=False)
         tracker = AttackMetricsTracker()
 
         images_processed  = 0
@@ -230,12 +156,8 @@ def run_pgsl_attack(attack_type, client_model,
                 client_tensor  = pgsl_preprocess_fn(inputs)
                 target_smashed = client_model(client_tensor)
 
-            reconstructed_pgsl = attacker.reconstruct(
-                target_smashed, client_tensor.shape
-            )
-            reconstructed_orig = PGSLDefenseModules.depth_to_space_upsample(
-                reconstructed_pgsl, original_channels=in_channels
-            )
+            reconstructed_pgsl = attacker.reconstruct(target_smashed, client_tensor.shape)
+            reconstructed_orig = PGSLDefenseModules.depth_to_space_upsample(reconstructed_pgsl, original_channels=in_channels)
 
             tracker.log_batch(originals_dn, reconstructed_orig)
             images_processed += inputs.shape[0]
@@ -256,10 +178,8 @@ def run_pgsl_attack(attack_type, client_model,
 
         return summary, originals_vis, reconstructed_vis
 
-    # ── AE decoder attack ─────────────────────────────────────────────────────
     elif attack_type == 'ae_decoder':
-        # pgsl_preprocess_fn passed so the AE decoder collects smashed data
-        # from PGSLClientModel correctly (space_to_depth applied first)
+        
         return run_ae_decoder_attack(
             client_model=client_model,
             train_loader=train_loader,
@@ -279,10 +199,6 @@ def run_pgsl_attack(attack_type, client_model,
 
 
 def save_pgsl_visualization(originals, reconstructed, baseline_summary, pgsl_summary):
-    """
-    Side-by-side visualization: original vs PGSL-attacked reconstruction.
-    Shows how PGSL degrades attacker's reconstruction quality.
-    """
     num = min(8, len(originals))
     fig = plt.figure(figsize=(num * 2, 5))
     gs  = gridspec.GridSpec(2, num, hspace=0.35)
@@ -315,8 +231,7 @@ def save_pgsl_visualization(originals, reconstructed, baseline_summary, pgsl_sum
         f'SSIM={baseline_summary["mean_ssim"]:.4f} | '
         f'PGSL: PSNR={pgsl_summary["mean_psnr"]:.2f}dB '
         f'SSIM={pgsl_summary["mean_ssim"]:.4f}',
-        fontsize=11, fontweight='bold'
-    )
+        fontsize=11, fontweight='bold')
 
     save_path = f"{Config.RESULTS_DIR}/pgsl_attack_comparison_{Config.DATASET}.png"
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -325,7 +240,6 @@ def save_pgsl_visualization(originals, reconstructed, baseline_summary, pgsl_sum
 
 
 def print_comparison_table(baseline_summary, pgsl_summary):
-    """Prints the attack vs defense comparison table for thesis."""
     print("\n" + "="*60)
     print("   THESIS COMPARISON TABLE — PGSL DEFENSE EVALUATION")
     print("="*60)
@@ -352,7 +266,6 @@ def print_comparison_table(baseline_summary, pgsl_summary):
     print("  SDANI defense will be evaluated next for comparison.")
 
 
-# ── Main runner ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
 
     print("="*60)
@@ -365,16 +278,11 @@ if __name__ == "__main__":
 
     os.makedirs(Config.RESULTS_DIR, exist_ok=True)
 
-    # Load data
     dataset = DatasetLoader(dataset_name=Config.DATASET)
     train_loader, test_loader = dataset.get_loaders()
 
-    # Load or train PGSL model
-    client_model, server_model = load_or_train_pgsl(
-        device, train_loader, test_loader
-    )
+    client_model, server_model = load_or_train_pgsl(device, train_loader, test_loader)
 
-    # Load existing baseline attack results for comparison
     baseline_csv = f"{Config.RESULTS_DIR}/attack_evaluation_{Config.DATASET}.csv"
     if os.path.exists(baseline_csv):
         baseline_df      = pd.read_csv(baseline_csv)
@@ -388,8 +296,6 @@ if __name__ == "__main__":
         print("    Using placeholder zeros for comparison.")
         baseline_summary = {'mean_psnr': 0.0, 'mean_ssim': 0.0}
 
-    # Run attack against PGSL
-    # ── Attack selection ──────────────────────────────────────────────────────
     print("\n  Select attack to run against PGSL:")
     print("  1 = White-Box rMSE attack")
     print("  2 = AE Decoder attack (ResSFL paper protocol)")
@@ -399,59 +305,28 @@ if __name__ == "__main__":
     run_whitebox  = attack_choice in ('', '1', '3')
     run_ae_dec    = attack_choice in ('2', '3')
 
-    # ── White-box attack ──────────────────────────────────────────────────────
     wb_summary = None
     if run_whitebox:
-        wb_summary, wb_orig, wb_recon = run_pgsl_attack(
-            attack_type='whitebox',
-            client_model=client_model,
-            train_loader=train_loader,
-            test_loader=test_loader,
-            device=device
-        )
-        pd.DataFrame([wb_summary]).to_csv(
-            f"{Config.RESULTS_DIR}/pgsl_attack_evaluation_{Config.DATASET}.csv",
-            index=False
-        )
+        wb_summary, wb_orig, wb_recon = run_pgsl_attack(attack_type='whitebox', client_model=client_model, train_loader=train_loader, test_loader=test_loader, device=device)
+        pd.DataFrame([wb_summary]).to_csv(f"{Config.RESULTS_DIR}/pgsl_attack_evaluation_{Config.DATASET}.csv", index=False)
         print(f"  Results saved → "
               f"{Config.RESULTS_DIR}/pgsl_attack_evaluation_{Config.DATASET}.csv")
 
         if len(wb_orig) > 0:
-            save_pgsl_visualization(
-                wb_orig, wb_recon,
-                baseline_summary, wb_summary
-            )
+            save_pgsl_visualization(wb_orig, wb_recon, baseline_summary, wb_summary)
         print_comparison_table(baseline_summary, wb_summary)
 
-    # ── AE decoder attack ─────────────────────────────────────────────────────
     ae_summary = None
     if run_ae_dec:
-        ae_summary, ae_orig, ae_recon = run_pgsl_attack(
-            attack_type='ae_decoder',
-            client_model=client_model,
-            train_loader=train_loader,
-            test_loader=test_loader,
-            device=device
-        )
+        ae_summary, ae_orig, ae_recon = run_pgsl_attack( attack_type='ae_decoder', client_model=client_model, train_loader=train_loader, test_loader=test_loader, device=device)
         pd.DataFrame([ae_summary]).to_csv(
-            f"{Config.RESULTS_DIR}/pgsl_ae_attack_{Config.DATASET}.csv",
-            index=False
-        )
+            f"{Config.RESULTS_DIR}/pgsl_ae_attack_{Config.DATASET}.csv", index=False)
         print(f"  Results saved → "
               f"{Config.RESULTS_DIR}/pgsl_ae_attack_{Config.DATASET}.csv")
 
         if len(ae_orig) > 0:
-            save_ae_attack_visualization(
-                originals=ae_orig,
-                reconstructed=ae_recon,
-                baseline_summary=baseline_summary,
-                defense_summary=ae_summary,
-                defense_name='PGSL',
-                dataset=Config.DATASET,
-                results_dir=Config.RESULTS_DIR
-            )
+            save_ae_attack_visualization(originals=ae_orig, reconstructed=ae_recon, baseline_summary=baseline_summary, defense_summary=ae_summary,  defense_name='PGSL', dataset=Config.DATASET, results_dir=Config.RESULTS_DIR)
 
-    # ── Combined table if both ran ────────────────────────────────────────────
     if wb_summary is not None and ae_summary is not None:
         print("\n" + "="*68)
         print("   PGSL — WHITE-BOX vs AE DECODER COMPARISON")

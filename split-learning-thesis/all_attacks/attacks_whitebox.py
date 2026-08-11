@@ -5,7 +5,6 @@ import numpy as np
 import os
 import pandas as pd
 
-
 class AttackMetricsTracker:
 
     def __init__(self):
@@ -62,31 +61,25 @@ class WhiteBoxInversionAttack:
         self.lr         = lr
         self.dataset    = dataset
 
-        # Normalization parameters — must match DatasetLoader transforms
         if dataset == 'CIFAR10':
             self.mean = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1)
             self.std  = torch.tensor([0.2023, 0.1994, 0.2010]).view(1, 3, 1, 1)
-        else:  # MNIST
+        else:  
             self.mean = torch.tensor([0.1307]).view(1, 1, 1, 1)
             self.std  = torch.tensor([0.3081]).view(1, 1, 1, 1)
 
     def _total_variation_loss(self, x):
 
-        # Squared differences in both spatial directions
         diff_h = (x[:, :, 1:, :] - x[:, :, :-1, :]) ** 2
         diff_w = (x[:, :, :, 1:] - x[:, :, :, :-1]) ** 2
 
-        # Pad to match dimensions before summing
-        # diff_h: [B, C, H-1, W]  diff_w: [B, C, H, W-1]
-        # Take minimum spatial extent for element-wise combination
         h_min = min(diff_h.shape[2], diff_w.shape[2])
         w_min = min(diff_h.shape[3], diff_w.shape[3])
 
-        # Isotropic: square root of sum of squared spatial differences
         iso_tv = torch.sqrt(
             diff_h[:, :, :h_min, :w_min] +
             diff_w[:, :, :h_min, :w_min] +
-            1e-8  # numerical stability inside sqrt
+            1e-8 
 )
         return torch.mean(iso_tv)
 
@@ -94,12 +87,9 @@ class WhiteBoxInversionAttack:
 
         device = target_smashed_single.device
 
-        # Move normalization tensors to correct device
         mean = self.mean.to(device)
         std  = self.std.to(device)
 
-        # Initialize at constant 0.5 gray — exactly as specified in paper
-        # "The input image is initialized with constant gray, i.e. 0.5"
         reconstructed_x = torch.full(single_input_shape, 0.5,device=device, requires_grad=True)
 
         optimizer = optim.Adam([reconstructed_x], lr=self.lr)
@@ -108,20 +98,14 @@ class WhiteBoxInversionAttack:
         for step in range(self.iterations):
             optimizer.zero_grad()
 
-            # Normalize before passing to client model
-            # Client model was trained on normalized data
             normalized_x = (reconstructed_x - mean) / std
 
-            # Forward pass through frozen client model
             current_smashed = self.client_model(normalized_x)
 
-            # Euclidean distance in feature space (Eq. 3a)
             loss_ed = criterion(current_smashed, target_smashed_single)
 
-            # Isotropic TV prior (Eq. 3b with β=1.0)
             loss_tv = self._total_variation_loss(reconstructed_x)
 
-            # Combined objective (Eq. 3c)
             total_loss = loss_ed + self.lambda_tv * loss_tv
             total_loss.backward()
             optimizer.step()
@@ -134,7 +118,6 @@ class WhiteBoxInversionAttack:
                     f"Total Loss: {total_loss.item():.6f}"
                 )
 
-            # Clamp to valid unnormalized pixel range
             with torch.no_grad():
                 reconstructed_x.clamp_(0.0, 1.0)
 
@@ -143,15 +126,12 @@ class WhiteBoxInversionAttack:
     def reconstruct(self, target_smashed_data, input_shape):
         
         batch_size     = target_smashed_data.shape[0]
-        # Single image input shape: (1, C, H, W)
         single_shape   = (1, input_shape[1], input_shape[2], input_shape[3])
         reconstructed_list = []
 
         for i in range(batch_size):
-            # Slice one smashed activation and reconstruct its input
-            single_smashed = target_smashed_data[i:i+1]  # [1, C, H, W]
+            single_smashed = target_smashed_data[i:i+1] 
             single_recon   = self._reconstruct_single(single_smashed, single_shape)
             reconstructed_list.append(single_recon)
 
-        # Stack back into full batch: [B, C, H, W]
         return torch.cat(reconstructed_list, dim=0)

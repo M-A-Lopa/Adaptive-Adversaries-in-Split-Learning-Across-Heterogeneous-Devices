@@ -1,3 +1,5 @@
+import sys, os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import os
 import torch
 import pandas as pd
@@ -9,9 +11,8 @@ from all_attacks.attacks_whitebox import WhiteBoxInversionAttack, AttackMetricsT
 from all_defences.dpsl_defense import DPSLDefense
 
 
-EPSILON_VALUES = [10, 50, 100, 200, 500, 1000]  
-DELTA          = 1e-5
-CLIP_NORM      = 32.0                     
+EPSILON_VALUES = [2, 3, 4, 5, 10]
+DELTA          = 1e-5                     
 
 MAX_IMAGES     = 32                           
 ITERATIONS     = 1000                           
@@ -104,7 +105,7 @@ if __name__ == "__main__":
         print(f"  DP-SL DEFENSE — epsilon = {eps}")
         print("="*60)
 
-        defense = DPSLDefense(epsilon=eps, delta=DELTA, clip_norm=CLIP_NORM)
+        defense = DPSLDefense(epsilon=eps, delta=DELTA)
         print(f"  {defense}")
 
         acc = trainer.evaluate_with_defense(defense.protect)
@@ -130,7 +131,7 @@ if __name__ == "__main__":
     base_psnr = results[0]["psnr"]
     base_ssim = results[0]["ssim"]
 
-    opt_row = next((r for r in results if r["epsilon"] == 200), results[1])
+    opt_row = next((r for r in results if r["epsilon"] == 5), results[1])
     eps_val = opt_row["epsilon"]
     dpsl_label = f"DP-SL Defense (eps = {float(eps_val):.1f})"
 

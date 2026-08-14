@@ -108,7 +108,7 @@ class SplitLearningTrainer:
     def train(self):
 
         print("\n" + "="*60)
-        print("   VANILLA SPLIT LEARNING — TRAINING START")
+        print(f"   {Config.MODEL_NAME} SPLIT LEARNING — TRAINING START")
         print("="*60)
         print(f"  Dataset    : {Config.DATASET}")
         print(f"  Epochs     : {Config.EPOCHS}")
@@ -141,7 +141,7 @@ class SplitLearningTrainer:
 
     def _save_checkpoint(self, epoch, best_acc):
 
-        save_path = f"{Config.SAVE_DIR}/best_vanilla_sl_{Config.DATASET}.pth"
+        save_path = f"{Config.SAVE_DIR}/best_{Config.MODEL_NAME.lower()}_{Config.DATASET}.pth"
         torch.save({
             'epoch'        : epoch,
             'client_state' : self.client_model.state_dict(),
@@ -188,6 +188,6 @@ class SplitLearningTrainer:
             'train_loss'    : self.train_losses,
             'train_accuracy': self.train_accuracies,
             'test_accuracy' : self.test_accuracies})
-        path = f"{Config.RESULTS_DIR}/vanilla_sl_results_{Config.DATASET}.csv"
+        path = f"{Config.RESULTS_DIR}/{Config.MODEL_NAME}_results_{Config.DATASET}.csv"
         df.to_csv(path, index=False)
         print(f"  Results saved → {path}")

@@ -109,11 +109,11 @@ def build_ae(dataset='CIFAR10', activation='sigmoid'):
 
     if dataset == 'CIFAR10':
         ae = custom_AE(input_nc=32, output_nc=3,
-                       input_dim=8, output_dim=32,
+                       input_dim=4, output_dim=32,   
                        activation=activation)
     elif dataset == 'MNIST':
         ae = custom_AE(input_nc=32, output_nc=1,
-                       input_dim=7, output_dim=28,
+                       input_dim=3, output_dim=28,   
                        activation=activation)
     else:
         raise ValueError(f"Unsupported dataset: {dataset}")

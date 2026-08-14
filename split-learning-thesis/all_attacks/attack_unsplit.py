@@ -134,13 +134,16 @@ def print_metrics_table(results: dict):
     
 class UnSplitAttack:
 
-    def __init__(self, client_model, in_channels=3):
+    def __init__(self, client_model, in_channels=3, clone_builder=None):
         self.device = torch.device(Config.DEVICE if torch.cuda.is_available() else 'cpu')
 
         self.client_model = client_model.to(self.device)
         self.client_model.eval()
-
-        self.clone_model = ClientModel(in_channels=in_channels).to(self.device)
+        
+        if clone_builder is not None:
+            self.clone_model = clone_builder().to(self.device)
+        else:
+            self.clone_model = ClientModel(in_channels=in_channels).to(self.device)
 
         self.tv_lambda = 1e-3
 
@@ -358,7 +361,7 @@ class UnSplitAttack:
                                fontweight='bold')
 
         plt.suptitle(f'UnSplit Attack — {tag.replace("_", " ").title()}\n'f'{Config.DATASET} | Cut Layer {Config.CUT_LAYER}',fontsize=12, fontweight='bold')
-        save_path = f"{Config.RESULTS_DIR}/unsplit_{tag}.png"
+        save_path = f"{Config.RESULTS_DIR}/{Config.MODEL_NAME.lower()}_unsplit_{tag}.png"
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
         print(f"  Visualization saved → {save_path}")

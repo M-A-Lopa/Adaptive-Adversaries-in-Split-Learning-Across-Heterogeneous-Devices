@@ -8,6 +8,9 @@ from all_split_learning.split_learning import SplitLearningTrainer
 from all_attacks.attack_unsplit import UnSplitAttack
 from all_attacks.attacks_whitebox import WhiteBoxInversionAttack, AttackMetricsTracker
 from all_attacks.ae_decoder_attack import run_ae_decoder_attack, save_ae_attack_visualization
+from all_attacks.fsha_attack import FSHAAttack
+from all_attacks.label_leakage_attack import GradientNormLabelLeakageAttack, build_binary_split_loaders
+from all_attacks.villain_backdoor_attack import VILLAINBackdoorAttack, build_indexed_loader
 from all_model.models import ClientModel, ServerModel
 from all_model.kagn_models import KAGNClientModel, KAGNServerModel
 from all_model.pyramid_cnn import PyramidCNNClientModel, PyramidCNNServerModel
@@ -74,6 +77,22 @@ if __name__ == "__main__":
         else:
             return ClientModel(in_channels=in_channels)
 
+    def build_fresh_split(num_classes): #Used by Label Leakage and VILLAIN
+        if Config.MODEL_NAME == "KAGN":
+            fresh_client = KAGNClientModel(cut_layer=Config.CUT_LAYER,
+                                           in_channels=in_channels, degree=Config.DEGREE)
+            fresh_server = KAGNServerModel(cut_layer=Config.CUT_LAYER, num_classes=num_classes,
+                                           in_channels=in_channels, degree=Config.DEGREE)
+        elif Config.MODEL_NAME == "PyramidCNN":
+            fresh_client = PyramidCNNClientModel(cut_layer=Config.CUT_LAYER,
+                                                 in_channels=in_channels)
+            fresh_server = PyramidCNNServerModel(cut_layer=Config.CUT_LAYER, num_classes=num_classes,
+                                                 in_channels=in_channels)
+        else:
+            fresh_client = ClientModel(in_channels=in_channels)
+            fresh_server = ServerModel(num_classes=num_classes)
+        return fresh_client, fresh_server
+
     checkpoint_path = f"{Config.SAVE_DIR}/best_{Config.MODEL_NAME.lower()}_sl_{Config.DATASET}.pth"
     
     if os.path.exists(checkpoint_path):
@@ -94,6 +113,28 @@ if __name__ == "__main__":
 
         MAX_IMAGES  = 32
         ITERATIONS  = 1000
+
+        HIJACK_EPOCHS    = 5
+        CRITIC_ITERS     = 5
+
+        LEAKAGE_EPOCHS   = 5
+        POSITIVE_CLASS   = 0
+        POSITIVE_RATIO   = 0.1
+        LEAKAGE_BATCH    = 128
+        LEAKAGE_LR       = 1e-4
+
+        WARMUP_EPOCHS    = 5
+        INFERENCE_EPOCHS = 5
+        INJECTION_EPOCHS = 10
+        VILLAIN_BATCH    = 128
+        TARGET_LABEL     = 0
+        TRIGGER_BETA     = 1.0
+        TRIGGER_FRACTION = 0.5
+        DROPOUT_KEEP     = 0.75
+        GAMMA_LOW        = 0.6
+        GAMMA_HIGH       = 1.2
+        POISON_RATE      = 0.01
+        CANDIDATES       = 14
 
         if Config.DATASET == 'CIFAR10':
             mean = torch.tensor([0.4914, 0.4822, 0.4465]).view(1,3,1,1).to(device)
@@ -197,24 +238,179 @@ if __name__ == "__main__":
                 results_dir=Config.RESULTS_DIR
             )
 
-        # ── Combined summary table ────────────────────────────────────────────
-        print("\n" + "="*68)
+        #Attack 4: FSHA 
+        print("\n" + "="*60)
+        print(f"  FSHA ATTACK — {Config.MODEL_NAME}")
+        print("="*60)
+
+        fsha_client = build_fresh_client().to(device)
+
+        fsha_attacker = FSHAAttack(
+            client_model=fsha_client,
+            in_channels=in_channels,
+            dataset=Config.DATASET,
+            pilot_builder=build_fresh_client,
+            critic_iters=CRITIC_ITERS
+        )
+        fsha_attacker.hijack(train_loader, test_loader, epochs=HIJACK_EPOCHS)
+        fsha_summary = fsha_attacker.reconstruct(train_loader, num_images=MAX_IMAGES)
+        all_results['FSHA'] = fsha_summary
+
+        fsha_source = f"{Config.RESULTS_DIR}/fsha_no_defense.png"
+        fsha_target = f"{Config.RESULTS_DIR}/fsha_{Config.MODEL_NAME.lower()}_{Config.DATASET}.png"
+        if os.path.exists(fsha_source):
+            if os.path.exists(fsha_target):
+                os.remove(fsha_target)
+            os.rename(fsha_source, fsha_target)
+
+        pd.DataFrame([fsha_summary]).to_csv(
+            f"{Config.RESULTS_DIR}/attack_fsha_{Config.MODEL_NAME.lower()}_{Config.DATASET}.csv",
+            index=False
+        )
+
+        #Attack 5: Gradient-Norm Label Leakage 
+        print("\n" + "="*60)
+        print(f"  LABEL LEAKAGE ATTACK — {Config.MODEL_NAME}")
+        print("="*60)
+
+        binary_train_loader, binary_test_loader = build_binary_split_loaders(
+            train_loader.dataset,
+            target_class=POSITIVE_CLASS,
+            positive_ratio=POSITIVE_RATIO,
+            batch_size=LEAKAGE_BATCH
+        )
+
+        leakage_client, leakage_server = build_fresh_split(num_classes=1)
+
+        leakage_attacker = GradientNormLabelLeakageAttack(
+            client_model=leakage_client,
+            server_model=leakage_server,
+            dataset=Config.DATASET,
+            target_class=POSITIVE_CLASS,
+            learning_rate=LEAKAGE_LR
+        )
+        leakage_summary = leakage_attacker.run(
+            binary_train_loader, binary_test_loader, epochs=LEAKAGE_EPOCHS
+        )
+        leakage_attacker.save_visualization(
+            tag=f"{Config.MODEL_NAME.lower()}_{Config.DATASET}"
+        )
+        all_results['LabelLeakage'] = leakage_summary
+
+        pd.DataFrame([leakage_summary]).to_csv(
+            f"{Config.RESULTS_DIR}/attack_label_leakage_{Config.MODEL_NAME.lower()}_{Config.DATASET}.csv",
+            index=False
+        )
+        pd.DataFrame(leakage_attacker.history).to_csv(
+            f"{Config.RESULTS_DIR}/label_leakage_batches_{Config.MODEL_NAME.lower()}_{Config.DATASET}.csv",
+            index=False
+        )
+
+        #Attack 6: VILLAIN Client-Side Trigger Backdoor 
+        print("\n" + "="*60)
+        print(f"  VILLAIN BACKDOOR ATTACK — {Config.MODEL_NAME}")
+        print("="*60)
+
+        indexed_loader = build_indexed_loader(
+            train_loader.dataset, batch_size=VILLAIN_BATCH, shuffle=True
+        )
+
+        villain_client, villain_server = build_fresh_split(num_classes=Config.NUM_CLASSES)
+
+        villain_attacker = VILLAINBackdoorAttack(
+            client_model=villain_client,
+            server_model=villain_server,
+            base_dataset=train_loader.dataset,
+            dataset=Config.DATASET,
+            num_classes=Config.NUM_CLASSES,
+            target_label=TARGET_LABEL,
+            beta=TRIGGER_BETA,
+            trigger_fraction=TRIGGER_FRACTION,
+            dropout_keep=DROPOUT_KEEP,
+            gamma_low=GAMMA_LOW,
+            gamma_high=GAMMA_HIGH,
+            poison_rate=POISON_RATE,
+            candidates_per_batch=CANDIDATES
+        )
+
+        villain_attacker.warmup(indexed_loader, epochs=WARMUP_EPOCHS)
+        villain_baseline, _ = villain_attacker.evaluate(test_loader)
+        print(f"  Clean data accuracy before attack: {villain_baseline:.2f}%")
+
+        villain_attacker.infer_labels(indexed_loader, epochs=INFERENCE_EPOCHS)
+        villain_attacker.fabricate_trigger(indexed_loader)
+        villain_attacker.inject_backdoor(indexed_loader, test_loader, epochs=INJECTION_EPOCHS)
+
+        villain_summary = villain_attacker.summarise(
+            test_loader=test_loader, clean_baseline=villain_baseline
+        )
+        villain_attacker.save_visualization(
+            tag=f"{Config.MODEL_NAME.lower()}_{Config.DATASET}"
+        )
+        all_results['VILLAIN'] = villain_summary
+
+        pd.DataFrame([villain_summary]).to_csv(
+            f"{Config.RESULTS_DIR}/attack_villain_{Config.MODEL_NAME.lower()}_{Config.DATASET}.csv",
+            index=False
+        )
+        pd.DataFrame(villain_attacker.history).to_csv(
+            f"{Config.RESULTS_DIR}/villain_epochs_{Config.MODEL_NAME.lower()}_{Config.DATASET}.csv",
+            index=False
+        )
+
+        # ── Combined summary table ────────────────────────────────
+        blank = "—"
+
+        print("\n" + "="*94)
         print(f"   ALL ATTACKS SUMMARY — {Config.MODEL_NAME} on {Config.DATASET}")
-        print("="*68)
-        print(f"{'Attack':<20} {'PSNR (dB)':>12} {'SSIM':>10}")
-        print("-"*45)
-        print(f"  {'White-Box':<18} {wb_summary['mean_psnr']:>12.2f} "
-              f"{wb_summary['mean_ssim']:>10.4f}")
-        print(f"  {'UnSplit':<18} {unsplit_summary['psnr']:>12.2f} "
-              f"{unsplit_summary['ssim']:>10.4f}")
-        print(f"  {'AE Decoder':<18} {ae_summary['mean_psnr']:>12.2f} "
-              f"{ae_summary['mean_ssim']:>10.4f}")
-        print("="*68)
+        print("="*94)
+        print(f"{'Attack':<20} {'PSNR (dB)':>11} {'SSIM':>9} {'MSE':>9} "
+              f"{'Leak AUC':>10} {'LIA (%)':>9} {'ASR (%)':>9} {'CDA (%)':>9}")
+        print("-"*94)
+        print(f"  {'White-Box':<18} {wb_summary['mean_psnr']:>11.2f} {wb_summary['mean_ssim']:>9.4f} "
+              f"{blank:>9} {blank:>10} {blank:>9} {blank:>9} {blank:>9}")
+        print(f"  {'UnSplit':<18} {unsplit_summary['psnr']:>11.2f} {unsplit_summary['ssim']:>9.4f} "
+              f"{blank:>9} {blank:>10} {blank:>9} {blank:>9} {blank:>9}")
+        print(f"  {'AE Decoder':<18} {ae_summary['mean_psnr']:>11.2f} {ae_summary['mean_ssim']:>9.4f} "
+              f"{blank:>9} {blank:>10} {blank:>9} {blank:>9} {blank:>9}")
+        print(f"  {'FSHA':<18} {fsha_summary['psnr']:>11.2f} {fsha_summary['ssim']:>9.4f} "
+              f"{fsha_summary['mse']:>9.5f} {blank:>10} {blank:>9} {blank:>9} {blank:>9}")
+        print(f"  {'Label Leakage':<18} {blank:>11} {blank:>9} {blank:>9} "
+              f"{leakage_summary['q95_norm_leak_auc_cut']:>10.4f} {blank:>9} {blank:>9} {blank:>9}")
+        print(f"  {'VILLAIN':<18} {blank:>11} {blank:>9} {blank:>9} {blank:>10} "
+              f"{villain_summary['lia']:>9.2f} {villain_summary['asr']:>9.2f} {villain_summary['cda']:>9.2f}")
+        print("="*94)
+
+        print("\n" + "-"*94)
+        print("   LABEL LEAKAGE DETAIL (95% quantile leak AUC over batches)")
+        print("-"*94)
+        print(f"  {'Norm (cut layer)':<28} {leakage_summary['q95_norm_leak_auc_cut']:>10.4f}")
+        print(f"  {'Cosine (cut layer)':<28} {leakage_summary['q95_cosine_leak_auc_cut']:>10.4f}")
+        print(f"  {'Norm (first layer)':<28} {leakage_summary['q95_norm_leak_auc_first']:>10.4f}")
+        print(f"  {'Cosine (first layer)':<28} {leakage_summary['q95_cosine_leak_auc_first']:>10.4f}")
+        print(f"  {'Majority counting accuracy':<28} {leakage_summary['q95_majority_accuracy_cut']:>10.4f}")
+        print("-"*94)
 
         combined_path = f"{Config.RESULTS_DIR}/all_attacks_{Config.MODEL_NAME.lower()}_{Config.DATASET}.csv"
         pd.DataFrame({
-            'attack': ['WhiteBox', 'UnSplit', 'AE_Decoder'],
-            'psnr': [wb_summary['mean_psnr'], unsplit_summary['psnr'], ae_summary['mean_psnr']],
-            'ssim': [wb_summary['mean_ssim'], unsplit_summary['ssim'], ae_summary['mean_ssim']]
+            'attack': ['WhiteBox', 'UnSplit', 'AE_Decoder', 'FSHA', 'LabelLeakage', 'VILLAIN'],
+            'psnr': [wb_summary['mean_psnr'], unsplit_summary['psnr'], ae_summary['mean_psnr'],
+                     fsha_summary['psnr'], None, None],
+            'ssim': [wb_summary['mean_ssim'], unsplit_summary['ssim'], ae_summary['mean_ssim'],
+                     fsha_summary['ssim'], None, None],
+            'mse': [None, None, None, fsha_summary['mse'], None, None],
+            'norm_leak_auc_cut': [None, None, None, None,
+                                  leakage_summary['q95_norm_leak_auc_cut'], None],
+            'cosine_leak_auc_cut': [None, None, None, None,
+                                    leakage_summary['q95_cosine_leak_auc_cut'], None],
+            'norm_leak_auc_first': [None, None, None, None,
+                                    leakage_summary['q95_norm_leak_auc_first'], None],
+            'cosine_leak_auc_first': [None, None, None, None,
+                                      leakage_summary['q95_cosine_leak_auc_first'], None],
+            'majority_accuracy': [None, None, None, None,
+                                  leakage_summary['q95_majority_accuracy_cut'], None],
+            'lia': [None, None, None, None, None, villain_summary['lia']],
+            'asr': [None, None, None, None, None, villain_summary['asr']],
+            'cda': [None, None, None, None, None, villain_summary['cda']]
         }).to_csv(combined_path, index=False)
         print(f"\n  Combined results saved → {combined_path}")

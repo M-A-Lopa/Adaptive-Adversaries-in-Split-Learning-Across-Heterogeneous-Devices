@@ -29,7 +29,6 @@ def normalize(x, dataset):
 
 
 def apply_trigger_patch(images_raw01, patch_size=4, value=1.0):
-    """BadNets-style fixed pixel patch in the bottom-right corner (Chen et al., 2017)."""
     patched = images_raw01.clone()
     h, w = patched.shape[-2], patched.shape[-1]
     patched[:, :, h - patch_size:h, w - patch_size:w] = value
@@ -44,16 +43,11 @@ def extract_targets(base_dataset):
         targets = targets.cpu().numpy()
     return np.asarray(targets)
 
-class DummyNoDefense:
-    """No-op placeholder defense, mirroring DummyNoDefense in
-    run_dpsl_evaluation.py. Plugged into BackdoorPoisonAttack so a future
-    ZORRO / ProtoGuard-SL defense can be swapped in the same way DPSLDefense
-    and PGSLDefenseModules are swapped into the other attack pipelines --
-    just implement `.filter_gradient(gradient, poisoned_mask)` and pass an
-    instance via the `defense=` argument."""
 
-    def filter_gradient(self, gradient, poisoned_mask=None):
-        return gradient
+class DummyNoDefense:
+
+    def protect(self, smashed_data, labels=None):
+        return smashed_data
 
     def __repr__(self):
         return "DummyNoDefense()"
@@ -64,7 +58,7 @@ class BackdoorPoisonAttack:
                  num_classes=Config.NUM_CLASSES, mode='client', target_label=0,
                  poison_rate=0.05, patch_size=4, trigger_value=1.0,
                  surrogate_builder=None, learning_rate=1e-3,
-                 defense=None, model_tag='vanilla'):
+                 model_tag='vanilla'):
 
         assert mode in ('client', 'server'), "mode must be 'client' or 'server'"
 
@@ -86,8 +80,6 @@ class BackdoorPoisonAttack:
         self.criterion = nn.CrossEntropyLoss()
 
         self.targets = extract_targets(base_dataset)
-
-        self.defense = defense if defense is not None else DummyNoDefense()
 
         self.surrogate_client = None
         self.surrogate_optimizer = None
@@ -118,7 +110,8 @@ class BackdoorPoisonAttack:
         print(f"  Poison rate     : {poison_rate}")
         print(f"  Trigger         : {patch_size}x{patch_size} patch, value={trigger_value} "
               f"(BadNets-style, bottom-right corner)")
-        print(f"  Defense         : {self.defense}")
+        print(f"  Defense         : none during training (attacker trains undefended); "
+              f"pass defense= to evaluate() to test one afterwards")
 
 
     def load_clean_init(self, checkpoint_path):
@@ -145,6 +138,8 @@ class BackdoorPoisonAttack:
         return f"{Config.SAVE_DIR}/best_backdoor_{self.mode}_{self.model_tag}_{self.dataset}.pth"
 
     def load_checkpoint(self):
+        """Load a previously-poisoned model, if one was already saved by this
+        attack. Returns True on success (skip re-training in that case)."""
         path = self._checkpoint_path()
         if not os.path.exists(path):
             return False
@@ -175,9 +170,7 @@ class BackdoorPoisonAttack:
 
 
     def _poison_batch(self, images, labels):
-        """Patch a poison_rate fraction of non-target-label samples in this
-        batch and relabel them to target_label. Returns (images, labels, mask)
-        where mask marks which rows were poisoned, so a defense can act on it."""
+
         labels = labels.clone()
         eligible = (labels != self.target_label).nonzero(as_tuple=True)[0]
         mask = torch.zeros(images.shape[0], dtype=torch.bool, device=images.device)
@@ -245,21 +238,20 @@ class BackdoorPoisonAttack:
               "split-learning training with the honest client...")
 
 
-    def _split_step(self, inputs, labels, poisoned_mask=None):
-        self.client_optimizer.zero_grad()
-        embedding = self.client_model(inputs)
+    def _split_step(self, inputs, labels):
 
-        upload = embedding.detach().requires_grad_(True)
+        self.client_optimizer.zero_grad()
+        smashed_data = self.client_model(inputs)
+
+        smashed_data_server = smashed_data.detach().requires_grad_(True)
 
         self.server_optimizer.zero_grad()
-        outputs = self.server_model(upload)
+        outputs = self.server_model(smashed_data_server)
         loss = self.criterion(outputs, labels)
         loss.backward()
         self.server_optimizer.step()
 
-        returned_gradient = self.defense.filter_gradient(upload.grad, poisoned_mask)
-
-        embedding.backward(returned_gradient)
+        smashed_data.backward(smashed_data_server.grad)
         self.client_optimizer.step()
 
         return loss.item(), outputs.detach()
@@ -280,11 +272,10 @@ class BackdoorPoisonAttack:
                 images = images.to(self.device)
                 labels = labels.to(self.device)
 
-                poisoned_mask = None
                 if self.mode == 'client':
-                    images, labels, poisoned_mask = self._poison_batch(images, labels)
+                    images, labels, _ = self._poison_batch(images, labels)
 
-                loss_value, outputs = self._split_step(images, labels, poisoned_mask)
+                loss_value, outputs = self._split_step(images, labels)
 
                 running_loss += loss_value
                 total += labels.size(0)
@@ -305,7 +296,10 @@ class BackdoorPoisonAttack:
                 self._save_checkpoint(epoch, attack_success, clean_acc)
 
 
-    def evaluate(self, test_loader):
+    def evaluate(self, test_loader, defense=None):
+
+        active_defense = defense if defense is not None else DummyNoDefense()
+
         self.client_model.eval()
         self.server_model.eval()
 
@@ -317,7 +311,8 @@ class BackdoorPoisonAttack:
                 images = images.to(self.device)
                 labels = labels.to(self.device)
 
-                outputs = self.server_model(self.client_model(images))
+                smashed = active_defense.protect(self.client_model(images), labels)
+                outputs = self.server_model(smashed)
                 clean_total += labels.size(0)
                 clean_correct += outputs.argmax(1).eq(labels).sum().item()
 
@@ -326,7 +321,10 @@ class BackdoorPoisonAttack:
                     continue
 
                 triggered = self._apply_trigger_eval(images[rows])
-                triggered_outputs = self.server_model(self.client_model(triggered))
+                triggered_smashed = active_defense.protect(
+                    self.client_model(triggered), labels[rows]
+                )
+                triggered_outputs = self.server_model(triggered_smashed)
                 attack_total += int(rows.sum())
                 attack_success += int(triggered_outputs.argmax(1).eq(self.target_label).sum())
 
@@ -347,11 +345,10 @@ class BackdoorPoisonAttack:
             'poison_rate': self.poison_rate,
             'asr': asr,
             'cda': clean_acc,
-            'defense': repr(self.defense),
         }
 
         print("\n" + "=" * 60)
-        print(f"   BACKDOOR POISONING RESULTS -- mode='{self.mode}' | defense={self.defense}")
+        print(f"   BACKDOOR POISONING RESULTS -- mode='{self.mode}' (no defense)")
         print("=" * 60)
         print(f"  Attack success rate (ASR) : {asr:.2f}%")
         print(f"  Clean data accuracy (CDA) : {clean_acc:.2f}%")

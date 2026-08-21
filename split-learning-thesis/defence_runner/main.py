@@ -14,7 +14,7 @@ from all_attacks.villain_backdoor_attack import VILLAINBackdoorAttack, build_ind
 from all_model.models import ClientModel, ServerModel
 from all_model.kagn_models import KAGNClientModel, KAGNServerModel
 from all_model.pyramid_cnn import PyramidCNNClientModel, PyramidCNNServerModel
-
+from all_attacks.backdoor_poison_attack import BackdoorPoisonAttack
 
 def plot_results(train_losses, train_accuracies, test_accuracies, dataset_name):
     
@@ -135,6 +135,13 @@ if __name__ == "__main__":
         GAMMA_HIGH       = 1.2
         POISON_RATE      = 0.01
         CANDIDATES       = 14
+
+        BACKDOOR_TARGET_LABEL     = 0
+        BACKDOOR_POISON_RATE      = 0.05
+        BACKDOOR_PATCH_SIZE       = 4
+        BACKDOOR_TRIGGER_VALUE    = 1.0
+        BACKDOOR_TRAIN_EPOCHS     = 10
+        BACKDOOR_SURROGATE_EPOCHS = 5   # server mode only
 
         if Config.DATASET == 'CIFAR10':
             mean = torch.tensor([0.4914, 0.4822, 0.4465]).view(1,3,1,1).to(device)
@@ -358,6 +365,84 @@ if __name__ == "__main__":
             index=False
         )
 
+        #Attack 7: Backdoor Poisoning -- Client-Side 
+        print("\n" + "="*60)
+        print(f"  BACKDOOR POISONING ATTACK (CLIENT-SIDE) — {Config.MODEL_NAME}")
+        print("="*60)
+
+        backdoor_c_client, backdoor_c_server = build_fresh_split(num_classes=Config.NUM_CLASSES)
+
+        backdoor_client_attacker = BackdoorPoisonAttack(
+            client_model=backdoor_c_client,
+            server_model=backdoor_c_server,
+            base_dataset=train_loader.dataset,
+            dataset=Config.DATASET,
+            num_classes=Config.NUM_CLASSES,
+            mode='client',
+            target_label=BACKDOOR_TARGET_LABEL,
+            poison_rate=BACKDOOR_POISON_RATE,
+            patch_size=BACKDOOR_PATCH_SIZE,
+            trigger_value=BACKDOOR_TRIGGER_VALUE,
+            model_tag=f"{Config.MODEL_NAME.lower()}_sl",
+        )
+
+        backdoor_client_attacker.train(train_loader, test_loader, epochs=BACKDOOR_TRAIN_EPOCHS)
+        backdoor_client_summary = backdoor_client_attacker.summarise()
+        backdoor_client_attacker.save_visualization(
+            tag=f"{Config.MODEL_NAME.lower()}_{Config.DATASET}"
+        )
+        all_results['BackdoorPoison_Client'] = backdoor_client_summary
+
+        pd.DataFrame([backdoor_client_summary]).to_csv(
+            f"{Config.RESULTS_DIR}/attack_backdoor_poison_client_{Config.MODEL_NAME.lower()}_{Config.DATASET}.csv",
+            index=False
+        )
+        pd.DataFrame(backdoor_client_attacker.history).to_csv(
+            f"{Config.RESULTS_DIR}/backdoor_poison_client_epochs_{Config.MODEL_NAME.lower()}_{Config.DATASET}.csv",
+            index=False
+        )
+
+        #Attack 8: Backdoor Poisoning -- Server-Side
+        print("\n" + "="*60)
+        print(f"  BACKDOOR POISONING ATTACK (SERVER-SIDE) — {Config.MODEL_NAME}")
+        print("="*60)
+
+        backdoor_s_client, backdoor_s_server = build_fresh_split(num_classes=Config.NUM_CLASSES)
+
+        backdoor_server_attacker = BackdoorPoisonAttack(
+            client_model=backdoor_s_client,
+            server_model=backdoor_s_server,
+            base_dataset=train_loader.dataset,
+            dataset=Config.DATASET,
+            num_classes=Config.NUM_CLASSES,
+            mode='server',
+            target_label=BACKDOOR_TARGET_LABEL,
+            poison_rate=BACKDOOR_POISON_RATE,
+            patch_size=BACKDOOR_PATCH_SIZE,
+            trigger_value=BACKDOOR_TRIGGER_VALUE,
+            surrogate_builder=build_fresh_client,   # attacker's own client-arch clone
+            model_tag=f"{Config.MODEL_NAME.lower()}_sl",
+        )
+
+        backdoor_server_attacker.pretrain_server_backdoor(
+            test_loader, epochs=BACKDOOR_SURROGATE_EPOCHS
+        )
+        backdoor_server_attacker.train(train_loader, test_loader, epochs=BACKDOOR_TRAIN_EPOCHS)
+        backdoor_server_summary = backdoor_server_attacker.summarise()
+        backdoor_server_attacker.save_visualization(
+            tag=f"{Config.MODEL_NAME.lower()}_{Config.DATASET}"
+        )
+        all_results['BackdoorPoison_Server'] = backdoor_server_summary
+
+        pd.DataFrame([backdoor_server_summary]).to_csv(
+            f"{Config.RESULTS_DIR}/attack_backdoor_poison_server_{Config.MODEL_NAME.lower()}_{Config.DATASET}.csv",
+            index=False
+        )
+        pd.DataFrame(backdoor_server_attacker.history).to_csv(
+            f"{Config.RESULTS_DIR}/backdoor_poison_server_epochs_{Config.MODEL_NAME.lower()}_{Config.DATASET}.csv",
+            index=False
+        )
+
         # ── Combined summary table ────────────────────────────────
         blank = "—"
 
@@ -379,6 +464,10 @@ if __name__ == "__main__":
               f"{leakage_summary['q95_norm_leak_auc_cut']:>10.4f} {blank:>9} {blank:>9} {blank:>9}")
         print(f"  {'VILLAIN':<18} {blank:>11} {blank:>9} {blank:>9} {blank:>10} "
               f"{villain_summary['lia']:>9.2f} {villain_summary['asr']:>9.2f} {villain_summary['cda']:>9.2f}")
+        print(f"  {'Backdoor(Client)':<18} {blank:>11} {blank:>9} {blank:>9} {blank:>10} "
+              f"{blank:>9} {backdoor_client_summary['asr']:>9.2f} {backdoor_client_summary['cda']:>9.2f}")
+        print(f"  {'Backdoor(Server)':<18} {blank:>11} {blank:>9} {blank:>9} {blank:>10} "
+              f"{blank:>9} {backdoor_server_summary['asr']:>9.2f} {backdoor_server_summary['cda']:>9.2f}")
         print("="*94)
 
         print("\n" + "-"*94)
@@ -393,24 +482,27 @@ if __name__ == "__main__":
 
         combined_path = f"{Config.RESULTS_DIR}/all_attacks_{Config.MODEL_NAME.lower()}_{Config.DATASET}.csv"
         pd.DataFrame({
-            'attack': ['WhiteBox', 'UnSplit', 'AE_Decoder', 'FSHA', 'LabelLeakage', 'VILLAIN'],
+            'attack': ['WhiteBox', 'UnSplit', 'AE_Decoder', 'FSHA', 'LabelLeakage', 'VILLAIN',
+                       'BackdoorPoison_Client', 'BackdoorPoison_Server'],
             'psnr': [wb_summary['mean_psnr'], unsplit_summary['psnr'], ae_summary['mean_psnr'],
-                     fsha_summary['psnr'], None, None],
+                     fsha_summary['psnr'], None, None, None, None],
             'ssim': [wb_summary['mean_ssim'], unsplit_summary['ssim'], ae_summary['mean_ssim'],
-                     fsha_summary['ssim'], None, None],
-            'mse': [None, None, None, fsha_summary['mse'], None, None],
+                     fsha_summary['ssim'], None, None, None, None],
+            'mse': [None, None, None, fsha_summary['mse'], None, None, None, None],
             'norm_leak_auc_cut': [None, None, None, None,
-                                  leakage_summary['q95_norm_leak_auc_cut'], None],
+                                  leakage_summary['q95_norm_leak_auc_cut'], None, None, None],
             'cosine_leak_auc_cut': [None, None, None, None,
-                                    leakage_summary['q95_cosine_leak_auc_cut'], None],
+                                    leakage_summary['q95_cosine_leak_auc_cut'], None, None, None],
             'norm_leak_auc_first': [None, None, None, None,
-                                    leakage_summary['q95_norm_leak_auc_first'], None],
+                                    leakage_summary['q95_norm_leak_auc_first'], None, None, None],
             'cosine_leak_auc_first': [None, None, None, None,
-                                      leakage_summary['q95_cosine_leak_auc_first'], None],
+                                      leakage_summary['q95_cosine_leak_auc_first'], None, None, None],
             'majority_accuracy': [None, None, None, None,
-                                  leakage_summary['q95_majority_accuracy_cut'], None],
-            'lia': [None, None, None, None, None, villain_summary['lia']],
-            'asr': [None, None, None, None, None, villain_summary['asr']],
-            'cda': [None, None, None, None, None, villain_summary['cda']]
+                                  leakage_summary['q95_majority_accuracy_cut'], None, None, None],
+            'lia': [None, None, None, None, None, villain_summary['lia'], None, None],
+            'asr': [None, None, None, None, None, villain_summary['asr'],
+                    backdoor_client_summary['asr'], backdoor_server_summary['asr']],
+            'cda': [None, None, None, None, None, villain_summary['cda'],
+                    backdoor_client_summary['cda'], backdoor_server_summary['cda']]
         }).to_csv(combined_path, index=False)
         print(f"\n  Combined results saved → {combined_path}")

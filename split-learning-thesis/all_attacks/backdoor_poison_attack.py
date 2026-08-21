@@ -8,7 +8,6 @@ from tqdm import tqdm
 
 from config import Config
 
-
 def _get_norm_stats(dataset, device):
     if dataset == 'CIFAR10':
         mean = torch.tensor([0.4914, 0.4822, 0.4465], device=device).view(1, 3, 1, 1)
@@ -45,13 +44,27 @@ def extract_targets(base_dataset):
         targets = targets.cpu().numpy()
     return np.asarray(targets)
 
+class DummyNoDefense:
+    """No-op placeholder defense, mirroring DummyNoDefense in
+    run_dpsl_evaluation.py. Plugged into BackdoorPoisonAttack so a future
+    ZORRO / ProtoGuard-SL defense can be swapped in the same way DPSLDefense
+    and PGSLDefenseModules are swapped into the other attack pipelines --
+    just implement `.filter_gradient(gradient, poisoned_mask)` and pass an
+    instance via the `defense=` argument."""
+
+    def filter_gradient(self, gradient, poisoned_mask=None):
+        return gradient
+
+    def __repr__(self):
+        return "DummyNoDefense()"
 
 class BackdoorPoisonAttack:
 
     def __init__(self, client_model, server_model, base_dataset, dataset=Config.DATASET,
                  num_classes=Config.NUM_CLASSES, mode='client', target_label=0,
                  poison_rate=0.05, patch_size=4, trigger_value=1.0,
-                 surrogate_builder=None, learning_rate=1e-3):
+                 surrogate_builder=None, learning_rate=1e-3,
+                 defense=None, model_tag='vanilla'):
 
         assert mode in ('client', 'server'), "mode must be 'client' or 'server'"
 
@@ -63,6 +76,7 @@ class BackdoorPoisonAttack:
         self.poison_rate = poison_rate
         self.patch_size = patch_size
         self.trigger_value = trigger_value
+        self.model_tag = model_tag
 
         self.client_model = client_model.to(self.device)
         self.server_model = server_model.to(self.device)
@@ -72,6 +86,8 @@ class BackdoorPoisonAttack:
         self.criterion = nn.CrossEntropyLoss()
 
         self.targets = extract_targets(base_dataset)
+
+        self.defense = defense if defense is not None else DummyNoDefense()
 
         self.surrogate_client = None
         self.surrogate_optimizer = None
@@ -85,7 +101,9 @@ class BackdoorPoisonAttack:
             self.surrogate_optimizer = optim.Adam(self.surrogate_client.parameters(), lr=learning_rate)
 
         self.history = {'epoch': [], 'asr': [], 'cda': []}
+        self.best_asr = 0.0
 
+        os.makedirs(Config.SAVE_DIR, exist_ok=True)
         os.makedirs(Config.RESULTS_DIR, exist_ok=True)
 
         print("\n" + "=" * 60)
@@ -100,13 +118,71 @@ class BackdoorPoisonAttack:
         print(f"  Poison rate     : {poison_rate}")
         print(f"  Trigger         : {patch_size}x{patch_size} patch, value={trigger_value} "
               f"(BadNets-style, bottom-right corner)")
+        print(f"  Defense         : {self.defense}")
+
+
+    def load_clean_init(self, checkpoint_path):
+        """Initialize client_model/server_model (and, in server mode, the
+        surrogate) from an existing clean vanilla-SL checkpoint, the same
+        'load-if-exists, else random init' convention used by pgsl_run.py /
+        ressfl_run.py. Returns True if a checkpoint was found and loaded."""
+        if not os.path.exists(checkpoint_path):
+            print(f"\n[!] No clean checkpoint found at: {checkpoint_path}")
+            print("    Starting the attack from a random init instead.")
+            return False
+
+        ckpt = torch.load(checkpoint_path, map_location=self.device)
+        self.client_model.load_state_dict(ckpt['client_state'])
+        self.server_model.load_state_dict(ckpt['server_state'])
+        if self.surrogate_client is not None:
+            self.surrogate_client.load_state_dict(ckpt['client_state'])
+
+        print(f"\n[✓] Loaded clean checkpoint: {checkpoint_path}")
+        print(f"    Clean accuracy: {ckpt.get('best_acc', float('nan')):.2f}%")
+        return True
+
+    def _checkpoint_path(self):
+        return f"{Config.SAVE_DIR}/best_backdoor_{self.mode}_{self.model_tag}_{self.dataset}.pth"
+
+    def load_checkpoint(self):
+        path = self._checkpoint_path()
+        if not os.path.exists(path):
+            return False
+        ckpt = torch.load(path, map_location=self.device)
+        self.client_model.load_state_dict(ckpt['client_state'])
+        self.server_model.load_state_dict(ckpt['server_state'])
+        self.history = ckpt.get('history', self.history)
+        self.best_asr = ckpt.get('best_asr', 0.0)
+        print(f"\n[✓] Found existing poisoned checkpoint: {path}")
+        print(f"    Best ASR so far: {self.best_asr:.2f}%")
+        return True
+
+    def _save_checkpoint(self, epoch, asr, cda):
+        path = self._checkpoint_path()
+        torch.save({
+            'epoch': epoch,
+            'client_state': self.client_model.state_dict(),
+            'server_state': self.server_model.state_dict(),
+            'best_asr': asr,
+            'cda': cda,
+            'history': self.history,
+            'dataset': self.dataset,
+            'mode': self.mode,
+            'model_tag': self.model_tag,
+            'target_label': self.target_label,
+            'poison_rate': self.poison_rate,
+        }, path)
+
 
     def _poison_batch(self, images, labels):
-
+        """Patch a poison_rate fraction of non-target-label samples in this
+        batch and relabel them to target_label. Returns (images, labels, mask)
+        where mask marks which rows were poisoned, so a defense can act on it."""
         labels = labels.clone()
         eligible = (labels != self.target_label).nonzero(as_tuple=True)[0]
+        mask = torch.zeros(images.shape[0], dtype=torch.bool, device=images.device)
         if eligible.numel() == 0:
-            return images, labels
+            return images, labels, mask
 
         n_poison = max(1, int(self.poison_rate * images.shape[0]))
         n_poison = min(n_poison, eligible.numel())
@@ -117,17 +193,20 @@ class BackdoorPoisonAttack:
         raw[chosen] = apply_trigger_patch(raw[chosen], self.patch_size, self.trigger_value)
         images = normalize(raw, self.dataset)
         labels[chosen] = self.target_label
+        mask[chosen] = True
 
-        return images, labels
+        return images, labels, mask
 
     def _apply_trigger_eval(self, images):
         raw = denormalize(images, self.dataset)
         raw = apply_trigger_patch(raw, self.patch_size, self.trigger_value)
         return normalize(raw, self.dataset)
 
-    # ---------------------------------------------------- server pre-poisoning
 
     def pretrain_server_backdoor(self, auxiliary_loader, epochs=5):
+
+        print(f"\n  Phase 1 -- server pre-poisoning via surrogate client "
+              f"({epochs} epoch(s) on auxiliary data)...")
 
         self.surrogate_client.train()
         self.server_model.train()
@@ -140,7 +219,7 @@ class BackdoorPoisonAttack:
                 images = images.to(self.device)
                 labels = labels.to(self.device)
 
-                images_p, labels_p = self._poison_batch(images, labels)
+                images_p, labels_p, _ = self._poison_batch(images, labels)
 
                 self.surrogate_optimizer.zero_grad()
                 self.server_optimizer.zero_grad()
@@ -166,7 +245,7 @@ class BackdoorPoisonAttack:
               "split-learning training with the honest client...")
 
 
-    def _split_step(self, inputs, labels):
+    def _split_step(self, inputs, labels, poisoned_mask=None):
         self.client_optimizer.zero_grad()
         embedding = self.client_model(inputs)
 
@@ -178,7 +257,9 @@ class BackdoorPoisonAttack:
         loss.backward()
         self.server_optimizer.step()
 
-        embedding.backward(upload.grad)
+        returned_gradient = self.defense.filter_gradient(upload.grad, poisoned_mask)
+
+        embedding.backward(returned_gradient)
         self.client_optimizer.step()
 
         return loss.item(), outputs.detach()
@@ -199,10 +280,11 @@ class BackdoorPoisonAttack:
                 images = images.to(self.device)
                 labels = labels.to(self.device)
 
+                poisoned_mask = None
                 if self.mode == 'client':
-                    images, labels = self._poison_batch(images, labels)
+                    images, labels, poisoned_mask = self._poison_batch(images, labels)
 
-                loss_value, outputs = self._split_step(images, labels)
+                loss_value, outputs = self._split_step(images, labels, poisoned_mask)
 
                 running_loss += loss_value
                 total += labels.size(0)
@@ -217,6 +299,10 @@ class BackdoorPoisonAttack:
             print(f"  Epoch {epoch+1:2d}/{epochs} | "
                   f"Loss: {running_loss/len(train_loader):.4f} | "
                   f"ASR: {attack_success:.2f}% | CDA: {clean_acc:.2f}%")
+
+            if attack_success >= self.best_asr:
+                self.best_asr = attack_success
+                self._save_checkpoint(epoch, attack_success, clean_acc)
 
 
     def evaluate(self, test_loader):
@@ -261,10 +347,11 @@ class BackdoorPoisonAttack:
             'poison_rate': self.poison_rate,
             'asr': asr,
             'cda': clean_acc,
+            'defense': repr(self.defense),
         }
 
         print("\n" + "=" * 60)
-        print(f"   BACKDOOR POISONING RESULTS -- mode='{self.mode}'")
+        print(f"   BACKDOOR POISONING RESULTS -- mode='{self.mode}' | defense={self.defense}")
         print("=" * 60)
         print(f"  Attack success rate (ASR) : {asr:.2f}%")
         print(f"  Clean data accuracy (CDA) : {clean_acc:.2f}%")

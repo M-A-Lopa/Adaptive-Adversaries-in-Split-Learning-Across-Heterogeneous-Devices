@@ -116,7 +116,7 @@ if __name__ == "__main__":
         MAX_IMAGES  = 32
         ITERATIONS  = 1000
 
-        HIJACK_EPOCHS    = 5
+        HIJACK_EPOCHS    = 50
         CRITIC_ITERS     = 5
 
         LEAKAGE_EPOCHS   = 5
@@ -125,17 +125,17 @@ if __name__ == "__main__":
         LEAKAGE_BATCH    = 128
         LEAKAGE_LR       = 1e-4
 
-        WARMUP_EPOCHS    = 5
+        WARMUP_EPOCHS    = 15
         INFERENCE_EPOCHS = 5
-        INJECTION_EPOCHS = 10
-        VILLAIN_BATCH    = 128
+        INJECTION_EPOCHS = 15
+        VILLAIN_BATCH    = 32
         TARGET_LABEL     = 0
         TRIGGER_BETA     = 1.0
         TRIGGER_FRACTION = 0.5
         DROPOUT_KEEP     = 0.75
         GAMMA_LOW        = 0.6
         GAMMA_HIGH       = 1.2
-        POISON_RATE      = 0.01
+        POISON_RATE      = 0.05
         CANDIDATES       = 14
 
         BACKDOOR_TARGET_LABEL     = 0

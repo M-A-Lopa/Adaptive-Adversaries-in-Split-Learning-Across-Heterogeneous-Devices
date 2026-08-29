@@ -247,12 +247,12 @@ class VILLAINBackdoorAttack:
         if self.theta is not None:
             threshold = self.theta
         else:
-            ratios = np.asarray([record[1] for record in admissible], dtype=float)
-            threshold = float(np.quantile(ratios, self.theta_quantile))
+            deviations = np.asarray([abs(record[1] - 1.0) for record in admissible], dtype=float)
+            threshold = float(np.quantile(deviations, self.theta_quantile))
 
         accepted = 0
         for index, ratio, previous, feature in pending:
-            if previous <= self.mu and ratio <= threshold:
+            if previous <= self.mu and abs(ratio - 1.0) <= threshold:
                 self.inferred_targets.add(index)
                 self._extend_inference_group(index)
                 self.selector_labels.append(torch.ones(1, device=self.device))

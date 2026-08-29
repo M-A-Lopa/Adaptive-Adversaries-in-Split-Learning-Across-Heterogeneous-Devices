@@ -195,10 +195,11 @@ class FSHAAttack:
                     return x.to(self.device)
 
                 pub_inputs = next_pub()
+                pub_targets = denormalize(pub_inputs, self.dataset)
                 self.pilot_optimizer.zero_grad()
                 pilot_smashed = self.pilot(pub_inputs)
                 recon = self.decoder(pilot_smashed)
-                recon_loss = self.mse(recon, pub_inputs)
+                recon_loss = self.mse(recon, pub_targets)
                 recon_loss.backward()
                 self.pilot_optimizer.step()
 

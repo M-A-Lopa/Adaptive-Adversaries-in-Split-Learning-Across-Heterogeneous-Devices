@@ -7,7 +7,7 @@ import matplotlib.gridspec as gridspec
 from torch.utils.data import TensorDataset, DataLoader
 
 from all_model.ressfl_models import custom_AE, xavier_init
-from all_defences.ressfl_defense import WindowedSSIM, denormalize
+from util.ae_decoder_metric import WindowedSSIM, denormalize
 from config import Config
 
 

@@ -10,7 +10,9 @@ from all_attacks.attack_unsplit import UnSplitAttack
 from all_attacks.attacks_whitebox import WhiteBoxInversionAttack, AttackMetricsTracker
 from all_attacks.ae_decoder_attack import run_ae_decoder_attack, save_ae_attack_visualization
 from all_attacks.fsha_attack import FSHAAttack
-from all_attacks.label_leakage_attack import GradientNormLabelLeakageAttack, build_binary_split_loaders
+from all_attacks.label_leakage_attack import build_binary_split_loaders
+from all_defences.label_protection_defense import LabelProtectionDefense, attach_label_protection
+from defence_runner.run_label_protection import TrackedLabelLeakageAttack, GradientObserver
 from all_attacks.villain_backdoor_attack import VILLAINBackdoorAttack, build_indexed_loader
 from all_model.models import ClientModel, ServerModel
 from all_model.kagn_models import KAGNClientModel, KAGNServerModel
@@ -296,16 +298,32 @@ if __name__ == "__main__":
 
         leakage_client, leakage_server = build_fresh_split(num_classes=1)
 
-        leakage_attacker = GradientNormLabelLeakageAttack(
+        leakage_attacker = TrackedLabelLeakageAttack(
             client_model=leakage_client,
             server_model=leakage_server,
             dataset=Config.DATASET,
             target_class=POSITIVE_CLASS,
             learning_rate=LEAKAGE_LR
         )
+        leakage_observer = GradientObserver()
+        attach_label_protection(leakage_attacker, LabelProtectionDefense('no_noise'), leakage_observer)
         leakage_summary = leakage_attacker.run(
             binary_train_loader, binary_test_loader, epochs=LEAKAGE_EPOCHS
         )
+        leakage_extra = leakage_observer.summary()
+        leakage_epochs = leakage_attacker.epoch_history
+        leakage_summary.update({
+            'test_accuracy': leakage_epochs['test_accuracy'][-1],
+            'best_test_accuracy': max(leakage_epochs['test_accuracy']),
+            'test_balanced_accuracy': leakage_epochs['test_balanced_accuracy'][-1],
+            'best_test_balanced_accuracy': max(leakage_epochs['test_balanced_accuracy']),
+            'test_loss': leakage_epochs['test_loss'][-1],
+            'chance_accuracy': 100 * leakage_extra['mean_chance_accuracy'],
+        })
+        for leak_attack in ['norm', 'cosine']:
+            for leak_metric in ['recovery_acc', 'recovery_bal_acc', 'worstcase_bal_acc']:
+                leakage_summary[f'{leak_attack}_{leak_metric}'] = \
+                    100 * leakage_extra[f'mean_{leak_attack}_{leak_metric}']
         leakage_attacker.save_visualization(
             tag=f"{Config.MODEL_NAME.lower()}_{Config.DATASET}"
         )
@@ -317,6 +335,14 @@ if __name__ == "__main__":
         )
         pd.DataFrame(leakage_attacker.history).to_csv(
             f"{Config.RESULTS_DIR}/label_leakage_batches_{Config.MODEL_NAME.lower()}_{Config.DATASET}.csv",
+            index=False
+        )
+        pd.DataFrame(leakage_observer.history).to_csv(
+            f"{Config.RESULTS_DIR}/label_leakage_recovery_{Config.MODEL_NAME.lower()}_{Config.DATASET}.csv",
+            index=False
+        )
+        pd.DataFrame(leakage_epochs).to_csv(
+            f"{Config.RESULTS_DIR}/label_leakage_epochs_{Config.MODEL_NAME.lower()}_{Config.DATASET}.csv",
             index=False
         )
 
@@ -468,7 +494,8 @@ if __name__ == "__main__":
         print(f"  {'FSHA':<18} {fsha_summary['psnr']:>11.2f} {fsha_summary['ssim']:>9.4f} "
               f"{fsha_summary['mse']:>9.5f} {blank:>10} {blank:>9} {blank:>9} {blank:>9}")
         print(f"  {'Label Leakage':<18} {blank:>11} {blank:>9} {blank:>9} "
-              f"{leakage_summary['q95_norm_leak_auc_cut']:>10.4f} {blank:>9} {blank:>9} {blank:>9}")
+              f"{leakage_summary['q95_norm_leak_auc_cut']:>10.4f} {leakage_summary['norm_recovery_acc']:>9.2f} "
+              f"{blank:>9} {leakage_summary['test_accuracy']:>9.2f}")
         print(f"  {'VILLAIN':<18} {blank:>11} {blank:>9} {blank:>9} {blank:>10} "
               f"{villain_summary['lia']:>9.2f} {villain_summary['asr']:>9.2f} {villain_summary['cda']:>9.2f}")
         print(f"  {'Backdoor(Client)':<18} {blank:>11} {blank:>9} {blank:>9} {blank:>10} "
@@ -478,13 +505,28 @@ if __name__ == "__main__":
         print("="*94)
 
         print("\n" + "-"*94)
-        print("   LABEL LEAKAGE DETAIL (95% quantile leak AUC over batches)")
+        print("   LABEL LEAKAGE DETAIL")
         print("-"*94)
-        print(f"  {'Norm (cut layer)':<28} {leakage_summary['q95_norm_leak_auc_cut']:>10.4f}")
-        print(f"  {'Cosine (cut layer)':<28} {leakage_summary['q95_cosine_leak_auc_cut']:>10.4f}")
-        print(f"  {'Norm (first layer)':<28} {leakage_summary['q95_norm_leak_auc_first']:>10.4f}")
-        print(f"  {'Cosine (first layer)':<28} {leakage_summary['q95_cosine_leak_auc_first']:>10.4f}")
-        print(f"  {'Majority counting accuracy':<28} {leakage_summary['q95_majority_accuracy_cut']:>10.4f}")
+        print("   Leak AUC (95% quantile over batches, 0.5 = chance)")
+        print(f"  {'Norm (cut layer)':<36} {leakage_summary['q95_norm_leak_auc_cut']:>10.4f}")
+        print(f"  {'Cosine (cut layer)':<36} {leakage_summary['q95_cosine_leak_auc_cut']:>10.4f}")
+        print(f"  {'Norm (first layer)':<36} {leakage_summary['q95_norm_leak_auc_first']:>10.4f}")
+        print(f"  {'Cosine (first layer)':<36} {leakage_summary['q95_cosine_leak_auc_first']:>10.4f}")
+        print("   Attacker label recovery accuracy (mean over batches)")
+        print(f"  {'Chance (predict all negative)':<36} {leakage_summary['chance_accuracy']:>9.2f}%")
+        for leak_attack in ['norm', 'cosine']:
+            print(f"  {f'{leak_attack.title()} acc / bal acc / worst-case':<36} "
+                  f"{leakage_summary[f'{leak_attack}_recovery_acc']:>9.2f}% / "
+                  f"{leakage_summary[f'{leak_attack}_recovery_bal_acc']:.2f}% / "
+                  f"{leakage_summary[f'{leak_attack}_worstcase_bal_acc']:.2f}%")
+        print(f"  {'Majority counting accuracy':<36} {100 * leakage_summary['mean_majority_accuracy_cut']:>9.2f}%")
+        print("   Main task (binary, positive class vs rest)")
+        print(f"  {'Test accuracy / best':<36} {leakage_summary['test_accuracy']:>9.2f}% / "
+              f"{leakage_summary['best_test_accuracy']:.2f}%")
+        print(f"  {'Balanced accuracy / best':<36} {leakage_summary['test_balanced_accuracy']:>9.2f}% / "
+              f"{leakage_summary['best_test_balanced_accuracy']:.2f}%")
+        print(f"  {'Test AUC / test loss':<36} {leakage_summary['test_auc']:>10.4f} / "
+              f"{leakage_summary['test_loss']:.4f}")
         print("-"*94)
 
         combined_path = f"{Config.RESULTS_DIR}/all_attacks_{Config.MODEL_NAME.lower()}_{Config.DATASET}.csv"
@@ -506,10 +548,24 @@ if __name__ == "__main__":
                                       leakage_summary['q95_cosine_leak_auc_first'], None, None, None],
             'majority_accuracy': [None, None, None, None,
                                   leakage_summary['q95_majority_accuracy_cut'], None, None, None],
-            'lia': [None, None, None, None, None, villain_summary['lia'], None, None],
+            'chance_accuracy': [None, None, None, None,
+                                leakage_summary['chance_accuracy'], None, None, None],
+            'norm_recovery_bal_acc': [None, None, None, None,
+                                      leakage_summary['norm_recovery_bal_acc'], None, None, None],
+            'norm_worstcase_bal_acc': [None, None, None, None,
+                                       leakage_summary['norm_worstcase_bal_acc'], None, None, None],
+            'cosine_worstcase_bal_acc': [None, None, None, None,
+                                         leakage_summary['cosine_worstcase_bal_acc'], None, None, None],
+            'lia': [None, None, None, None, leakage_summary['norm_recovery_acc'],
+                    villain_summary['lia'], None, None],
             'asr': [None, None, None, None, None, villain_summary['asr'],
                     backdoor_client_summary['asr'], backdoor_server_summary['asr']],
-            'cda': [None, None, None, None, None, villain_summary['cda'],
-                    backdoor_client_summary['cda'], backdoor_server_summary['cda']]
+            'cda': [None, None, None, None, leakage_summary['test_accuracy'], villain_summary['cda'],
+                    backdoor_client_summary['cda'], backdoor_server_summary['cda']],
+            'best_test_accuracy': [None, None, None, None,
+                                   leakage_summary['best_test_accuracy'], None, None, None],
+            'test_balanced_accuracy': [None, None, None, None,
+                                       leakage_summary['test_balanced_accuracy'], None, None, None],
+            'test_auc': [None, None, None, None, leakage_summary['test_auc'], None, None, None]
         }).to_csv(combined_path, index=False)
         print(f"\n  Combined results saved → {combined_path}")

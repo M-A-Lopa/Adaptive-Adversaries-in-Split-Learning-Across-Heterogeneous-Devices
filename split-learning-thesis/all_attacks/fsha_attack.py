@@ -195,10 +195,11 @@ class FSHAAttack:
                     return x.to(self.device)
 
                 pub_inputs = next_pub()
+                pub_targets = denormalize(pub_inputs, self.dataset)
                 self.pilot_optimizer.zero_grad()
                 pilot_smashed = self.pilot(pub_inputs)
                 recon = self.decoder(pilot_smashed)
-                recon_loss = self.mse(recon, pub_inputs)
+                recon_loss = self.mse(recon, pub_targets)
                 recon_loss.backward()
                 self.pilot_optimizer.step()
 
@@ -209,10 +210,14 @@ class FSHAAttack:
                     pub_batch = next_pub()
                     with torch.no_grad():
                         real_smashed = self.pilot(pub_batch)
+                    min_batch = min(real_smashed.shape[0], client_smashed_fixed.shape[0])
+                    real_smashed_matched = real_smashed[:min_batch]
+                    fake_smashed_matched = client_smashed_fixed[:min_batch]
+
                     self.critic_optimizer.zero_grad()
-                    d_real = self.critic(real_smashed)
-                    d_fake = self.critic(client_smashed_fixed)
-                    gp = gradient_penalty(self.critic, real_smashed, client_smashed_fixed, self.device)
+                    d_real = self.critic(real_smashed_matched)
+                    d_fake = self.critic(fake_smashed_matched)
+                    gp = gradient_penalty(self.critic, real_smashed_matched, fake_smashed_matched, self.device)
                     critic_loss = d_fake.mean() - d_real.mean() + self.gp_lambda * gp
                     critic_loss.backward()
                     self.critic_optimizer.step()

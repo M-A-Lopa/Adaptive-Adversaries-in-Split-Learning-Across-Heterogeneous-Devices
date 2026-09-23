@@ -7,13 +7,16 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from tqdm import tqdm
 from config import Config
-from all_model.models import ClientModel
 
 def total_variation(x):
+    h_tv = torch.pow(x[:, :, 1:, :] - x[:, :, :-1, :], 2).sum()
+    w_tv = torch.pow(x[:, :, :, 1:] - x[:, :, :, :-1], 2).sum()
+    count_h = x[:, :, 1:, :].numel()
+    count_w = x[:, :, :, 1:].numel()
+    return (h_tv / count_h + w_tv / count_w) / x.size(0)
 
-    diff_h = torch.abs(x[:, :, 1:, :] - x[:, :, :-1, :])
-    diff_w = torch.abs(x[:, :, :, 1:] - x[:, :, :, :-1])
-    return diff_h.mean() + diff_w.mean()
+def l2_loss(x):
+    return (x ** 2).mean()
 
 def denormalize(tensor, dataset='CIFAR10'):
 
@@ -27,16 +30,22 @@ def denormalize(tensor, dataset='CIFAR10'):
 
     return torch.clamp(tensor * std + mean, 0.0, 1.0)
 
-import torch
-import numpy as np
+
+def normalize_for_client(x, dataset='CIFAR10'):
+    if dataset == 'CIFAR10':
+        mean = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1).to(x.device)
+        std  = torch.tensor([0.2023, 0.1994, 0.2010]).view(1, 3, 1, 1).to(x.device)
+    else:
+        mean = torch.tensor([0.1307]).view(1, 1, 1, 1).to(x.device)
+        std  = torch.tensor([0.3081]).view(1, 1, 1, 1).to(x.device)
+    return (x - mean) / std
+
 
 def compute_mse(original, reconstructed):
-
     return torch.mean((original - reconstructed) ** 2).item()
 
 
 def compute_psnr(original, reconstructed):
-
     mse = torch.mean((original - reconstructed) ** 2)
     if mse == 0:
 
@@ -129,95 +138,90 @@ def print_metrics_table(results: dict):
         
     print("=" * 68)
     print("\n  Interpretation:")
-    print("  Lower MSE/PSNR/SSIM = stronger defense (harder to reconstruct)")
+    print("  Higher MSE, lower PSNR, lower SSIM = stronger defense (harder to reconstruct)")
     print("  Higher Accuracy      = better utility preservation")
     
 class UnSplitAttack:
 
-    def __init__(self, client_model, in_channels=3, clone_builder=None):
+    def __init__(self, client_model, in_channels=3, clone_builder=None,
+                 main_iters=100, input_iters=20, model_iters=20):
         self.device = torch.device(Config.DEVICE if torch.cuda.is_available() else 'cpu')
 
         self.client_model = client_model.to(self.device)
         self.client_model.eval()
-        
-        if clone_builder is not None:
-            self.clone_model = clone_builder().to(self.device)
-        else:
-            self.clone_model = ClientModel(in_channels=in_channels).to(self.device)
 
-        self.tv_lambda = 1e-3
-
-        self.clone_optimizer = optim.Adam(self.clone_model.parameters(), lr=0.001)
+        if clone_builder is None:
+            raise ValueError("clone_builder must be provided for UnSplit attack.")
+        self.clone_builder = clone_builder
 
         self.mse_loss = nn.MSELoss()
 
+        self.main_iters  = main_iters
+        self.input_iters = input_iters
+        self.model_iters = model_iters
+
         os.makedirs(Config.RESULTS_DIR, exist_ok=True)
 
+        probe_clone = self.clone_builder()
         print("\n" + "="*60)
         print("   UNSPLIT ATTACK — INITIALISED")
         print("="*60)
         print(f"  Attack type    : Data-Oblivious Model Inversion")
         print(f"  Requires data  : NO (architecture knowledge only)")
-        print(f"  TV lambda      : {self.tv_lambda}")
+        print(f"  Iters (main/input/model) : {self.main_iters}/{self.input_iters}/{self.model_iters}")
         print(f"  Clone params   : "
-              f"{sum(p.numel() for p in self.clone_model.parameters()):,}")
+              f"{sum(p.numel() for p in probe_clone.parameters()):,}")
+        del probe_clone
 
-    def _reconstruct_batch(self, smashed_data, input_shape, inversion_steps=300, lr_input=0.1):
-        
+    def _reconstruct_batch(self, clone_model, smashed_data, input_shape,
+                            lambda_tv=0.1, lambda_l2=1.0,
+                            lr_input=0.001, lr_model=0.001):
+
         batch_size = smashed_data.shape[0]
+        target = smashed_data.detach()
 
-        self.clone_model.train()
-        for _ in range(10):  
-            self.clone_optimizer.zero_grad()
+        x_pred = torch.full((batch_size, *input_shape), 0.5,
+                             device=self.device, requires_grad=True)
 
-            dummy = torch.randn(batch_size, *input_shape, device=self.device, requires_grad=False)
-            clone_smashed = self.clone_model(dummy)
+        input_optimizer = optim.Adam([x_pred], lr=lr_input, amsgrad=True)
+        model_optimizer = optim.Adam(clone_model.parameters(), lr=lr_model, amsgrad=True)
 
-            loss_steal = (self.mse_loss(clone_smashed.mean(dim=0), smashed_data.mean(dim=0)) + self.mse_loss(clone_smashed.std(dim=0),  smashed_data.std(dim=0)))
-            loss_steal.backward()
-            self.clone_optimizer.step()
+        for _ in range(self.main_iters):
 
-        self.clone_model.eval()
+            clone_model.eval()
+            for _ in range(self.input_iters):
+                input_optimizer.zero_grad()
+                pred = clone_model(normalize_for_client(x_pred, Config.DATASET))
+                loss = (self.mse_loss(pred, target)
+                        + lambda_tv * total_variation(x_pred)
+                        + lambda_l2 * l2_loss(x_pred))
+                loss.backward()
+                input_optimizer.step()
+                with torch.no_grad():
+                    x_pred.clamp_(0.0, 1.0)
 
-        dummy_input = torch.rand(batch_size, *input_shape,device=self.device).requires_grad_(True)
+            clone_model.train()
+            for _ in range(self.model_iters):
+                model_optimizer.zero_grad()
+                pred = clone_model(normalize_for_client(x_pred.detach(), Config.DATASET))
+                loss = self.mse_loss(pred, target)
+                loss.backward()
+                model_optimizer.step()
 
-        input_optimizer = optim.Adam([dummy_input], lr=lr_input)
+        clone_model.eval()
+        return x_pred.detach()
 
-        best_loss    = float('inf')
-        best_dummy   = dummy_input.detach().clone()
+    def run_attack(self, data_loader, num_batches=20):
 
-        for step in range(inversion_steps):
-            input_optimizer.zero_grad()
-
-            clone_output = self.clone_model(dummy_input)
-
-            loss_inv = self.mse_loss(clone_output, smashed_data.detach())
-
-            loss_tv  = self.tv_lambda * total_variation(dummy_input)
-
-            loss = loss_inv + loss_tv
-            loss.backward()
-            input_optimizer.step()
-
-            with torch.no_grad():
-                dummy_input.clamp_(0.0, 1.0)
-
-            if loss.item() < best_loss:
-                best_loss  = loss.item()
-                best_dummy = dummy_input.detach().clone()
-
-        return best_dummy
-
-    def run_attack(self, data_loader, num_batches=20, inversion_steps=300):
-        
         print(f"\n  Running UnSplit attack on {num_batches} batches...")
-        print(f"  Inversion steps per batch: {inversion_steps}")
+        print(f"  Main/input/model iters: {self.main_iters}/{self.input_iters}/{self.model_iters}")
 
-        in_channels = 1 if Config.DATASET == 'MNIST' else 3
         if Config.DATASET == 'MNIST':
             input_shape = (1, 28, 28)
         else:
             input_shape = (3, 32, 32)
+
+        clone_model = self.clone_builder().to(self.device)
 
         all_psnr  = []
         all_ssim  = []
@@ -236,7 +240,7 @@ class UnSplitAttack:
             with torch.no_grad():
                 smashed_data = self.client_model(images)
 
-            reconstructed = self._reconstruct_batch(smashed_data, input_shape, inversion_steps)
+            reconstructed = self._reconstruct_batch(clone_model, smashed_data, input_shape)
 
             originals_dn = denormalize(images, Config.DATASET)
 
@@ -263,21 +267,22 @@ class UnSplitAttack:
         print(f"  SSIM : {mean_ssim:.4f}")
         print("="*60)
         print("  These are your BASELINE attack numbers.")
-        print("  After defenses, all three metrics should improve.")
+        print("  After defense: MSE should increase, while PSNR and SSIM should decrease.")
 
         self._save_visualization(originals_store, reconstructed_store, tag='no_defense')
 
         return {'mse' : mean_mse, 'psnr': mean_psnr, 'ssim': mean_ssim}
 
-    def run_attack_with_defense(self, data_loader, defense_fn, defense_name, num_batches=20, inversion_steps=300):
+    def run_attack_with_defense(self, data_loader, defense_fn, defense_name, num_batches=20):
 
         print(f"\n  Running UnSplit attack WITH defense: {defense_name}")
 
-        in_channels = 1 if Config.DATASET == 'MNIST' else 3
         if Config.DATASET == 'MNIST':
             input_shape = (1, 28, 28)
         else:
             input_shape = (3, 32, 32)
+
+        clone_model = self.clone_builder().to(self.device)
 
         all_psnr = []
         all_ssim = []
@@ -297,7 +302,7 @@ class UnSplitAttack:
                 smashed_data = self.client_model(images)
                 smashed_protected = defense_fn(smashed_data)
 
-            reconstructed = self._reconstruct_batch(smashed_protected, input_shape, inversion_steps)
+            reconstructed = self._reconstruct_batch(clone_model, smashed_protected, input_shape)
 
             originals_dn = denormalize(images, Config.DATASET)
 

@@ -90,7 +90,7 @@ class WhiteBoxInversionAttack:
         mean = self.mean.to(device)
         std  = self.std.to(device)
 
-        reconstructed_x = torch.full(single_input_shape, 0.5,device=device, requires_grad=True)
+        reconstructed_x = torch.full(single_input_shape, 0.5, device=device, requires_grad=True)#initial guess for value = 0.5
 
         optimizer = optim.Adam([reconstructed_x], lr=self.lr)
         criterion = nn.MSELoss()

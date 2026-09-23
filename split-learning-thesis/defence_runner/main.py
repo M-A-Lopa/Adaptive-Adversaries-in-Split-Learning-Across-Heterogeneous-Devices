@@ -1,4 +1,5 @@
-import os
+import sys, os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -14,6 +15,7 @@ from all_attacks.villain_backdoor_attack import VILLAINBackdoorAttack, build_ind
 from all_model.models import ClientModel, ServerModel
 from all_model.kagn_models import KAGNClientModel, KAGNServerModel
 from all_model.pyramid_cnn import PyramidCNNClientModel, PyramidCNNServerModel
+from torch.utils.data import DataLoader
 from all_attacks.backdoor_poison_attack import BackdoorPoisonAttack
 
 def plot_results(train_losses, train_accuracies, test_accuracies, dataset_name):
@@ -114,7 +116,7 @@ if __name__ == "__main__":
         MAX_IMAGES  = 32
         ITERATIONS  = 1000
 
-        HIJACK_EPOCHS    = 5
+        HIJACK_EPOCHS    = 50
         CRITIC_ITERS     = 5
 
         LEAKAGE_EPOCHS   = 5
@@ -123,17 +125,17 @@ if __name__ == "__main__":
         LEAKAGE_BATCH    = 128
         LEAKAGE_LR       = 1e-4
 
-        WARMUP_EPOCHS    = 5
+        WARMUP_EPOCHS    = 15
         INFERENCE_EPOCHS = 5
-        INJECTION_EPOCHS = 10
-        VILLAIN_BATCH    = 128
+        INJECTION_EPOCHS = 15
+        VILLAIN_BATCH    = 32
         TARGET_LABEL     = 0
         TRIGGER_BETA     = 1.0
         TRIGGER_FRACTION = 0.5
         DROPOUT_KEEP     = 0.75
         GAMMA_LOW        = 0.6
         GAMMA_HIGH       = 1.2
-        POISON_RATE      = 0.01
+        POISON_RATE      = 0.05
         CANDIDATES       = 14
 
         BACKDOOR_TARGET_LABEL     = 0
@@ -252,6 +254,11 @@ if __name__ == "__main__":
 
         fsha_client = build_fresh_client().to(device)
 
+        fsha_private_loader = DataLoader(train_loader.dataset, batch_size=Config.BATCH_SIZE,
+                                         shuffle=True, num_workers=0, drop_last=True)
+        fsha_public_loader  = DataLoader(test_loader.dataset, batch_size=Config.BATCH_SIZE,
+                                         shuffle=True, num_workers=0, drop_last=True)
+        
         fsha_attacker = FSHAAttack(
             client_model=fsha_client,
             in_channels=in_channels,
@@ -259,7 +266,7 @@ if __name__ == "__main__":
             pilot_builder=build_fresh_client,
             critic_iters=CRITIC_ITERS
         )
-        fsha_attacker.hijack(train_loader, test_loader, epochs=HIJACK_EPOCHS)
+        fsha_attacker.hijack(fsha_private_loader, fsha_public_loader, epochs=HIJACK_EPOCHS)
         fsha_summary = fsha_attacker.reconstruct(train_loader, num_images=MAX_IMAGES)
         all_results['FSHA'] = fsha_summary
 

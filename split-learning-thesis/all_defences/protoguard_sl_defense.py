@@ -112,7 +112,7 @@ class ProtoGuardSLDefense:
     def __repr__(self):
         status = "fitted" if self.fitted else "NOT fitted"
         return (f"ProtoGuardSLDefense(alpha={self.alpha}, num_classes={self.num_classes}, "
-                f"{status})  [re-implemented from Shui et al. 2026, arXiv:2604.03595]")
+                f"{status})")
 
 
 if __name__ == "__main__":

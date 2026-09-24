@@ -120,10 +120,6 @@ if __name__ == "__main__":
     print(f"  Modes   : {args.mode}")
     print(f"  alpha   : {ALPHA} (paper default)")
     print("=" * 60)
-    print("  Note: no official ProtoGuard-SL repo exists (arXiv:2604.03595,")
-    print("  Apr. 2026) -- this is an independent re-implementation of the")
-    print("  paper's Algorithm 1.")
-    print("=" * 60)
 
     device = torch.device(Config.DEVICE if torch.cuda.is_available() else 'cpu')
     print(f"  Device  : {device}\n")

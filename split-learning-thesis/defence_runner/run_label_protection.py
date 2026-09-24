@@ -5,7 +5,6 @@ import torch
 import numpy as np
 import pandas as pd
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
 from sklearn.metrics import roc_auc_score, roc_curve
 from config import Config
 from dataset import DatasetLoader
@@ -197,7 +196,6 @@ def run_single(model_name, cut_layer, method, params, in_channels, loaders, phas
         summary = attack.run(loaders[0], loaders[1], epochs=TRAINING_EPOCHS)
 
         run_tag = f"{model_name.lower()}_cut{cut_label}_{tag}_{Config.DATASET}"
-        attack.save_visualization(tag=run_tag)
     finally:
         Config.CUT_LAYER = original_cut_layer
 
@@ -362,55 +360,6 @@ def print_table(results, title):
     print("=" * 120)
 
 
-def save_tradeoff_plot(df, model_name):
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-    markers = {"no_noise": "*", "max_norm": "s", "iso": "o", "marvell": "^", "perp": "D"}
-    for ax, (column, title) in zip(axes, [("norm_leak_auc_cut", "Norm"), ("cosine_leak_auc_cut_cleanref", "Cosine")]):
-        for method, group in df.groupby("method"):
-            ax.plot(group[column], group["test_accuracy_pct"], marker=markers.get(method, "o"),
-                    linestyle="-" if len(group) > 1 else "", markersize=9, label=method)
-        ax.axvline(0.5, color="k", linestyle="--", linewidth=1)
-        ax.set_xlabel(f"{title} leak AUC, cut layer (95% quantile)")
-        ax.set_ylabel("Test accuracy (%)")
-        ax.set_title(f"{title} attack")
-        ax.grid(True, alpha=0.3)
-        ax.legend()
-    plt.suptitle(f"Privacy-Utility Tradeoff -- {model_name} | Cut Layer {df['cut_layer'].iloc[0]} | {Config.DATASET}",
-                 fontsize=13, fontweight="bold")
-    plt.tight_layout()
-    plt.savefig(f"{Config.RESULTS_DIR}/label_protection_tradeoff_{model_name.lower()}_{Config.DATASET}.png",
-                dpi=150, bbox_inches="tight")
-    plt.close()
-
-
-def save_cut_layer_plot(df, model_name):
-    panels = [("norm_leak_auc_cut", "Norm leak AUC"),
-              ("cosine_leak_auc_cut_cleanref", "Cosine leak AUC (clean ref)"),
-              ("norm_worstcase_bal_acc_pct", "Worst-case recovery bal. acc (%)"),
-              ("test_accuracy_pct", "Test accuracy (%)"),
-              ("defense_ms_per_batch", "Defense time per batch (ms)")]
-    fig, axes = plt.subplots(1, len(panels), figsize=(5 * len(panels), 4.5))
-    for ax, (column, title) in zip(axes, panels):
-        for defense, group in df.groupby("defense"):
-            group = group.sort_values("cut_layer")
-            ax.plot(group["cut_layer"], group[column], marker="o", label=defense)
-        if "auc" in column:
-            ax.axhline(0.5, color="k", linestyle="--", linewidth=1)
-        if column == "norm_worstcase_bal_acc_pct":
-            ax.axhline(50.0, color="k", linestyle="--", linewidth=1)
-        ax.set_xlabel("Cut layer")
-        ax.set_title(title)
-        ax.set_xticks(sorted(df["cut_layer"].unique()))
-        ax.grid(True, alpha=0.3)
-    axes[0].legend(fontsize=8)
-    plt.suptitle(f"Label Protection Across Cut Layers -- {model_name} | {Config.DATASET}",
-                 fontsize=13, fontweight="bold")
-    plt.tight_layout()
-    plt.savefig(f"{Config.RESULTS_DIR}/label_protection_cut_layers_{model_name.lower()}_{Config.DATASET}.png",
-                dpi=150, bbox_inches="tight")
-    plt.close()
-
-
 def cut_layer_spread(df):
     metrics = ["norm_leak_auc_cut", "cosine_leak_auc_cut", "cosine_leak_auc_cut_cleanref",
                "norm_worstcase_bal_acc_pct", "cosine_worstcase_bal_acc_pct",
@@ -452,7 +401,6 @@ if __name__ == "__main__":
             model_rows = [run_single(model_name, Config.CUT_LAYER, method, params,
                                      in_channels, loaders, "PHASE A")
                           for method, params in DEFENSES_TO_RUN]
-            save_tradeoff_plot(pd.DataFrame(model_rows), model_name)
             phase_a.extend(model_rows)
 
         add_thesis_columns(phase_a)
@@ -471,7 +419,6 @@ if __name__ == "__main__":
                                      in_channels, loaders, "PHASE B")
                           for cut_layer in CUT_LAYERS_TO_SWEEP
                           for method, params in CUT_LAYER_SWEEP_DEFENSES]
-            save_cut_layer_plot(pd.DataFrame(model_rows), model_name)
             phase_b.extend(model_rows)
 
         add_thesis_columns(phase_b)

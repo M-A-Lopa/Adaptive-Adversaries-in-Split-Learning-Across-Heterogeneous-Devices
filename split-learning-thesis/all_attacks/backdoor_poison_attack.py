@@ -125,17 +125,32 @@ class BackdoorPoisonAttack:
             return False
 
         ckpt = torch.load(checkpoint_path, map_location=self.device)
-        self.client_model.load_state_dict(ckpt['client_state'])
-        self.server_model.load_state_dict(ckpt['server_state'])
-        if self.surrogate_client is not None:
-            self.surrogate_client.load_state_dict(ckpt['client_state'])
+        try:
+            self.client_model.load_state_dict(ckpt['client_state'])
+            self.server_model.load_state_dict(ckpt['server_state'])
+            if self.surrogate_client is not None:
+                self.surrogate_client.load_state_dict(ckpt['client_state'])
+        except RuntimeError:
+            # Clean checkpoints from main.py are not cut-aware; one trained at a
+            # different cut layer has different layers and cannot be loaded.
+            print(f"\n[!] Clean checkpoint {checkpoint_path} was trained at a different "
+                  f"cut layer (current cut = {Config.CUT_LAYER}).")
+            print("    Starting the attack from a random init instead.")
+            return False
 
         print(f"\n[✓] Loaded clean checkpoint: {checkpoint_path}")
         print(f"    Clean accuracy: {ckpt.get('best_acc', float('nan')):.2f}%")
         return True
 
+    def _cut_suffix(self):
+        # Vanilla has a fixed split, so its file name stays the same as before.
+        if self.model_tag.lower().startswith('vanilla'):
+            return ""
+        return f"_cut{Config.CUT_LAYER}"
+
     def _checkpoint_path(self):
-        return f"{Config.SAVE_DIR}/best_backdoor_{self.mode}_{self.model_tag}_{self.dataset}.pth"
+        return (f"{Config.SAVE_DIR}/best_backdoor_{self.mode}_{self.model_tag}"
+                f"{self._cut_suffix()}_{self.dataset}.pth")
 
     def load_checkpoint(self):
         """Load a previously-poisoned model, if one was already saved by this
@@ -372,7 +387,8 @@ class BackdoorPoisonAttack:
         plt.legend()
         plt.grid(True, alpha=0.3)
 
-        save_path = f"{Config.RESULTS_DIR}/backdoor_poison_{self.mode}_{tag}.png"
+        save_path = (f"{Config.RESULTS_DIR}/backdoor_poison_{self.mode}_{self.model_tag}"
+                     f"{self._cut_suffix()}_{self.dataset}_{tag}.png")
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
         print(f"  Visualization saved -> {save_path}")

@@ -1,6 +1,7 @@
 import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import argparse
 import torch
 import pandas as pd
 
@@ -46,7 +47,7 @@ def build_split_models(model_name, in_channels):
 def run_one(model_name, mode, device, train_loader, test_loader, base_dataset, in_channels):
     print("\n" + "#" * 70)
     print(f"#   PROTOGUARD-SL vs BACKDOOR POISONING ({mode.upper()}) "
-          f"-- MODEL: {model_name}  |  DATASET: {Config.DATASET}")
+          f"-- MODEL: {model_name}  |  CUT: {Config.CUT_LAYER}  |  DATASET: {Config.DATASET}")
     print("#" * 70)
 
     client_model, server_model = build_split_models(model_name, in_channels)
@@ -71,6 +72,7 @@ def run_one(model_name, mode, device, train_loader, test_loader, base_dataset, i
         model_tag=CLEAN_CHECKPOINT_TAGS.get(model_name, model_name.lower()),
     )
 
+    print(f"  Poisoned checkpoint path: {attack._checkpoint_path()}")
     if not attack.load_checkpoint():
         print(f"\n[!] No poisoned checkpoint found at: {attack._checkpoint_path()}")
         print("    Run defence_runner/run_backdoor_poison.py first to produce it. Skipping.")
@@ -90,6 +92,7 @@ def run_one(model_name, mode, device, train_loader, test_loader, base_dataset, i
 
     return {
         "model": model_name,
+        "cut_layer": Config.CUT_LAYER,
         "mode": mode,
         "no_defense_cda": baseline_cda,
         "no_defense_asr": baseline_asr,
@@ -99,9 +102,22 @@ def run_one(model_name, mode, device, train_loader, test_loader, base_dataset, i
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--cut", nargs="+", type=int, default=[Config.CUT_LAYER],
+                        help="cut layer(s), e.g. --cut 2 3")
+    parser.add_argument("--model", nargs="+", default=MODELS_TO_RUN,
+                        choices=["Vanilla", "PyramidCNN", "KAGN"])
+    parser.add_argument("--mode", nargs="+", default=MODES_TO_RUN, choices=["client", "server"])
+    parser.add_argument("--dataset", default=Config.DATASET, choices=["MNIST", "CIFAR10"])
+    args = parser.parse_args()
+    Config.DATASET = args.dataset
+
     print("=" * 60)
     print("  PROTOGUARD-SL DEFENSE EXPERIMENT")
     print(f"  Dataset : {Config.DATASET}")
+    print(f"  Models  : {args.model}")
+    print(f"  Cuts    : {args.cut}")
+    print(f"  Modes   : {args.mode}")
     print(f"  alpha   : {ALPHA} (paper default)")
     print("=" * 60)
     print("  Note: no official ProtoGuard-SL repo exists (arXiv:2604.03595,")
@@ -121,32 +137,41 @@ if __name__ == "__main__":
     in_channels = 1 if Config.DATASET == 'MNIST' else 3
 
     results = []
-    for model_name in MODELS_TO_RUN:
-        for mode in MODES_TO_RUN:
-            summary = run_one(model_name, mode, device, train_loader, test_loader,
-                              base_dataset, in_channels)
-            if summary is not None:
-                results.append(summary)
+    for cut in args.cut:
+        Config.CUT_LAYER = cut
+        for model_name in args.model:
+            if model_name == "Vanilla" and cut != 2:
+                print(f"\n  [skip] Vanilla has a fixed split (cut 2) -- skipping cut {cut}")
+                continue
+            for mode in args.mode:
+                summary = run_one(model_name, mode, device, train_loader, test_loader,
+                                  base_dataset, in_channels)
+                if summary is not None:
+                    results.append(summary)
 
     if not results:
         print("\n  No poisoned checkpoints were found -- nothing to evaluate.")
-        print("  Run defence_runner/run_backdoor_poison.py first.")
+        print("  Run defence_runner/run_backdoor_poison.py first (same cut layer).")
     else:
         df = pd.DataFrame(results)
         output_path = f"{Config.RESULTS_DIR}/protoguard_sl_defense_evaluation_{Config.DATASET}.csv"
+        if os.path.exists(output_path):          # keep earlier runs, replace same model/cut/mode
+            old = pd.read_csv(output_path)
+            if "cut_layer" in old.columns:
+                df = pd.concat([old, df]).drop_duplicates(
+                    subset=["model", "cut_layer", "mode"], keep="last")
+        df = df.sort_values(["cut_layer", "model", "mode"])
         df.to_csv(output_path, index=False)
 
-        print("\n" + "=" * 95)
-        print(f"   PROTOGUARD-SL DEFENSE EVALUATION -- ALL MODELS -- {Config.DATASET}")
-        print("=" * 95)
-        print(f"{'Model':<12} {'Mode':<8} {'No-Def CDA':>11} {'No-Def ASR':>11} "
+        print("\n" + "=" * 100)
+        print(f"   PROTOGUARD-SL DEFENSE EVALUATION -- {Config.DATASET}")
+        print("=" * 100)
+        print(f"{'Model':<12} {'Cut':>4} {'Mode':<8} {'No-Def CDA':>11} {'No-Def ASR':>11} "
               f"{'ProtoGuard CDA':>15} {'ProtoGuard ASR':>15}")
-        print("-" * 95)
-        for r in results:
-            print(f"  {r['model']:<10} {r['mode']:<8} "
+        print("-" * 100)
+        for r in df.to_dict("records"):
+            print(f"  {r['model']:<10} {int(r['cut_layer']):>4} {r['mode']:<8} "
                   f"{r['no_defense_cda']:>11.2f} {r['no_defense_asr']:>11.2f} "
                   f"{r['protoguard_cda']:>15.2f} {r['protoguard_asr']:>15.2f}")
-        print("=" * 95)
+        print("=" * 100)
         print(f"\nSaved raw data -> {output_path}")
-        print("\n  ProtoGuard-SL experiment complete.")
-        print(f"  All outputs in: {Config.RESULTS_DIR}/")

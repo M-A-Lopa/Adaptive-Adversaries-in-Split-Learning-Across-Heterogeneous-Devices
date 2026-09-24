@@ -404,7 +404,7 @@ if __name__ == "__main__":
             phase_a.extend(model_rows)
 
         add_thesis_columns(phase_a)
-        path_a = f"{Config.RESULTS_DIR}/label_protection_phaseA_defenses_{Config.DATASET}.csv"
+        path_a = f"{Config.RESULTS_DIR}/label_protection_phaseA_defenses_cut{Config.CUT_LAYER}_{Config.DATASET}.csv"
         pd.DataFrame(phase_a).to_csv(path_a, index=False)
         print_table(phase_a, f"LABEL PROTECTION PHASE A: DEFENSE SWEEP AT CUT LAYER {Config.CUT_LAYER}")
         for model_name in MODELS_TO_RUN:

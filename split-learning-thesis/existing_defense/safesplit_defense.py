@@ -32,28 +32,29 @@ class FrequencyAnalyzer:
               f"threshold={anomaly_threshold}")
     
     def _get_dct_low_freq(self, 
-                           model_params: torch.Tensor) -> np.ndarray:
-        
+                     model_params: torch.Tensor) -> np.ndarray:
+    
         params_np = model_params.detach().cpu().float().numpy().flatten()
-        
-        # 2D DCT এর জন্য reshape
+    
+        # 2D DCT के लिए reshape
         n = len(params_np)
         side = int(np.sqrt(n))
+
         if side * side < n:
-            # Pad করে square বানাও
-            padded = np.zeros(side * side + side)
-            padded[:n] = params_np
-            params_2d = padded[:side*(side+1)].reshape(side, side+1)
-        else:
-            params_2d = params_np[:side*side].reshape(side, side)
-        
-        # 2D DCT
-        dct_2d = dct(dct(params_2d.T, norm='ortho').T, norm='ortho')
-        
+            side += 1  # Increase side to make a bigger square
+
+        # Now pad to side*side
+        padded = np.zeros(side * side)
+        padded[:n] = params_np
+        params_2d = padded.reshape(side, side)
+    
+        # Compute 2D DCT
+        dct_2d = dct(dct(params_2d, axis=0), axis=1)
+    
         # Low-frequency component (top-left corner)
         k = max(1, int(min(params_2d.shape) * self.low_freq_ratio))
         low_freq = dct_2d[:k, :k].flatten()
-        
+    
         return low_freq
     
     def save_checkpoint(self, server_model: nn.Module):

@@ -70,6 +70,13 @@ ATTACK_LABEL = {"whitebox": "White-Box", "unsplit": "UnSplit", "ae_decoder": "AE
 RECON = {"whitebox", "unsplit", "ae_decoder", "fsha"}
 BACKDOOR = {"villain", "poison_client", "poison_server"}
 LOG_MARKERS = ["THESIS TABLE", "SUMMARY --", "SPLITGUARD DETECTION", "PHASE A", "ALGORITHM 3"]
+PROGRESS_LINES_PER_RUN = 4000
+EPOCH_RE = re.compile(r"\b(epoch|round)\s*\[?\s*\d+\s*/\s*\d+", re.I)
+ITER_RE = re.compile(r"Iteration (\d+)/(\d+)")
+CONTEXT_RE = re.compile(r"^\s*(#   |>> |Phase \d|Running |\[run info\]|Result:|Training complete|Collected |"
+                        r"Smashed data shape|Clean data accuracy|Hijacking complete|\[SplitGuard\]|"
+                        r"Accuracy WITH defense|BASELINE|R3eLU DEFENSE|SplitFSS|CONSENSUS|Poisoned checkpoint)")
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 DASH = "\u2014"
 VERDICT_COLORS = {"SUCCESS": "#d4edda", "PARTIAL": "#fff3cd", "FAILED": "#f4c7c3", "ATTACK-WEAK": "#e2e3e5"}
@@ -469,13 +476,53 @@ def accuracy_row(key, rows, status_entry):
     return out
 
 
-def runner_console_summary(key, model, cut):
+def read_log_lines(key, model, cut):
     path = log_path(key, model, cut)
     if not os.path.exists(path):
-        return None, None
+        return None
     with open(path, encoding="utf-8", errors="replace") as f:
-        lines = [ln.split("\r")[-1].rstrip() for ln in f.read().split("\n")]
-    lines = [ln for ln in lines if ln.strip() and "it/s]" not in ln and "s/it]" not in ln]
+        lines = [ANSI_RE.sub("", ln.split("\r")[-1]).rstrip() for ln in f.read().split("\n")]
+    return [ln for ln in lines if ln.strip() and "it/s]" not in ln and "s/it]" not in ln and "%|" not in ln]
+
+
+def is_separator(line):
+    t = line.strip()
+    return len(t) >= 10 and set(t) <= set("=-#")
+
+
+def log_progress(key, model, cut):
+    lines = read_log_lines(key, model, cut)
+    if lines is None:
+        return None, False
+    keep = [False] * len(lines)
+    for i, ln in enumerate(lines):
+        m = ITER_RE.search(ln)
+        if m:
+            keep[i] = m.group(1) == m.group(2)
+            continue
+        if EPOCH_RE.search(ln) or CONTEXT_RE.match(ln):
+            keep[i] = True
+        if i > 0 and is_separator(lines[i - 1]) and not is_separator(ln):
+            keep[i] = True
+        if "RESULTS" in ln:
+            seps, j = 0, i + 1
+            keep[max(0, i - 1)] = keep[i] = True
+            while j < len(lines) and j < i + 40 and seps < 2:
+                keep[j] = True
+                seps += is_separator(lines[j])
+                j += 1
+    out = []
+    for ln, k in zip(lines, keep):
+        if k and not (is_separator(ln) and out and is_separator(out[-1])):
+            out.append(ln)
+    truncated = len(out) > PROGRESS_LINES_PER_RUN
+    return out[:PROGRESS_LINES_PER_RUN], truncated
+
+
+def runner_console_summary(key, model, cut):
+    lines = read_log_lines(key, model, cut)
+    if lines is None:
+        return None, None
     starts = [i for i, ln in enumerate(lines) if any(m in ln for m in LOG_MARKERS)]
     summary = lines[max(0, starts[0] - 2):] if starts else []
     return summary[-600:], lines[-80:]
@@ -593,7 +640,8 @@ def build_pdf(runs, keys, status, path):
         "Section 4 = one page per defense in the attack-table layout (PSNR, SSIM, MSE, Leak AUC, LIA, ASR, CDA), "
         "with the label-leakage detail and the before/after verdicts. Appendix A = every setting each runner "
         "swept. Appendix B = every field of every result row (A to Z). Appendix C = each runner's own printed "
-        "summary tables copied from its log, and the end of the log for failed runs. All numbers come from your "
+        "summary tables copied from its log, and the end of the log for failed runs. Appendix D = every "
+        "training epoch line and every attack RESULTS block from the logs. All numbers come from your "
         "defense runners. Leak AUC = max of the norm and cosine attacks (95% quantile over batches). For "
         "SplitGuard (detection only) the FSHA row shows reconstruction quality if the client stops at detection.",
         small)]
@@ -778,6 +826,29 @@ def build_pdf(runs, keys, status, path):
                 story += [Paragraph("End of log:", small), Preformatted(wrap_mono(tail), mono)]
             if not summary and s.get("status") == "done":
                 story.append(Paragraph("No summary section found in the log.", small))
+
+    story += [PageBreak(), Paragraph("Appendix D \u2014 training progress and attack result blocks (from the logs)", h2),
+              Paragraph("Every per-epoch line the runner printed (AE decoder Val MSE, FSHA Critic / Hijack / "
+                        "Pilot-Recon, label-leakage, VILLAIN phases, backdoor and defense training epochs), every "
+                        "RESULTS block (MSE / PSNR / SSIM, ASR, CDA, LIA ...), the headers that say which attack and "
+                        "whether it is the baseline or the defended run, and the last white-box iteration per image. "
+                        "Progress bars are left out. The complete output of each run is in its log file "
+                        "(results/all_defenses/logs).", small)]
+    for m, c in runs:
+        for k in keys:
+            progress, truncated = log_progress(k, m, c)
+            if progress is None:
+                continue
+            s = status.get(status_key(m, c, k), {})
+            story += [Spacer(1, 4 * mm), Paragraph(f"{m} \u2014 cut {c} \u2014 {DEFENSES[k][0]} "
+                                                   f"({s.get('status', 'pending')})", h3)]
+            if progress:
+                story.append(Preformatted(wrap_mono(progress), mono))
+            else:
+                story.append(Paragraph("No epoch or result lines found in the log.", small))
+            if truncated:
+                story.append(Paragraph(f"Cut at {PROGRESS_LINES_PER_RUN} lines -- see "
+                                       f"{escape(os.path.relpath(log_path(k, m, c), ROOT))} for the rest.", small))
 
     def footer(canvas, doc):
         canvas.saveState()

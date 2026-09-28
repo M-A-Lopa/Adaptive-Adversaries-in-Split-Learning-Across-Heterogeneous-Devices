@@ -24,6 +24,7 @@ QUICK_TEST           = False
 RESUME               = True
 PREPARE_CHECKPOINTS  = True
 APPLY_RUNNER_FIXES   = True
+PDF_DIR              = "PDF"
 
 VANILLA_EPOCHS            = None
 BACKDOOR_TARGET_LABEL     = 0
@@ -122,6 +123,12 @@ def project_path(d):
 def results_dir():
     from config import Config
     return project_path(Config.RESULTS_DIR)
+
+
+def pdf_path():
+    d = project_path(PDF_DIR)
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, f"all_defenses_report_{DATASET}.pdf")
 
 
 def out_dir():
@@ -340,14 +347,46 @@ def collect(key, model, cut, seconds=None, code=None):
     return len(df)
 
 
+SKIP_DIRS = {"venv", ".venv", "env", ".git", "data", "results", "checkpoints", "__pycache__", "node_modules",
+             ".idea", ".vscode", "site-packages"}
+
+
+def find_runner(filename):
+    if os.path.exists(os.path.join(HERE, filename)):
+        return os.path.join(HERE, filename)
+    for folder, dirs, files in os.walk(ROOT):
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith("."))
+        if filename in files:
+            return os.path.join(folder, filename)
+    return None
+
+
+def missing_project_modules(runner_path):
+    import importlib.util
+    with open(runner_path, encoding="utf-8", errors="replace") as f:
+        src = f.read()
+    names = set(re.findall(r"^\s*from\s+((?:all_|util)[\w.]*)\s+import", src, flags=re.M))
+    names |= set(re.findall(r"^\s*import\s+((?:all_|util)[\w.]*)", src, flags=re.M))
+    missing = []
+    for name in sorted(names):
+        try:
+            if importlib.util.find_spec(name) is None:
+                missing.append(name)
+        except (ImportError, ValueError):
+            missing.append(name)
+    return missing
+
+
 def run_defense(key, model, cut, status):
     name, runner, _, _ = DEFENSES[key]
-    runner_path = os.path.join(HERE, runner)
+    runner_path = find_runner(runner)
     sk = status_key(model, cut, key)
-    if not os.path.exists(runner_path):
-        print(f"[!] runner not found: {runner_path} -- skipping {name}")
+    if runner_path is None:
+        print(f"[!] runner not found anywhere in {ROOT}: {runner} -- skipping {name}")
         status[sk] = {"status": "runner missing", "log": "", "finished": now()}
+        save_status(status)
         return False
+    print(f"[run_all_defenses] {name} runner: {os.path.relpath(runner_path, ROOT)}")
     drop_stale_rows(key, model, cut)
     job = base_job(model, cut, "run")
     job["runner"] = runner_path
@@ -880,7 +919,7 @@ def build_report(runs, keys, status, console=False):
                                    "cda": t["cda"], "verdict": t["verdict"]})
     summary = os.path.join(out_dir(), f"all_defenses_summary_table_{DATASET}.csv")
     pd.DataFrame(table_rows).to_csv(summary, index=False)
-    pdf = os.path.join(out_dir(), f"all_defenses_report_{DATASET}.pdf")
+    pdf = pdf_path()
     try:
         build_pdf(runs, keys, status, pdf)
         print(f"\n[run_all_defenses] PDF report updated -> {pdf}")
@@ -921,7 +960,21 @@ def main():
     print(f"  Runs       : {len(runs) * len(keys)} (models x cut layers x defenses)")
     print(f"  Mode       : {'report only' if a.report_only else 'QUICK TEST' if QUICK_TEST else 'full run'}"
           f" | resume {RESUME}")
-    print(f"  PDF        : {os.path.join(out_dir(), f'all_defenses_report_{DATASET}.pdf')} (updated after every run)")
+    print(f"  PDF        : {pdf_path()} (updated after every run)")
+    missing = [DEFENSES[k][1] for k in keys if find_runner(DEFENSES[k][1]) is None]
+    problems = []
+    for k in keys:
+        found = find_runner(DEFENSES[k][1])
+        gone = missing_project_modules(found) if found else []
+        state = "NOT FOUND -- will be skipped" if not found else os.path.relpath(found, ROOT)
+        if gone:
+            state += f"   [!] missing project files: {', '.join(gone)}"
+            problems.append(f"{DEFENSES[k][0]} needs {', '.join(g.replace('.', '/') + '.py' for g in gone)}")
+        print(f"  {DEFENSES[k][0]:<17}: {state}")
+    if missing:
+        print(f"  [!] missing runners: {', '.join(missing)}")
+    for p_ in problems:
+        print(f"  [!] {p_} -- this defense will fail until the file is copied into the project")
     print("=" * 94)
 
     if not a.report_only:

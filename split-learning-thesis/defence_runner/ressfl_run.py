@@ -10,7 +10,7 @@ from dataset import DatasetLoader
 from all_model.models import ClientModel, ServerModel
 from all_model.ressfl_models import build_ae, custom_AE
 from all_split_learning.ressfl_split_learning import ResSFLTrainer
-from all_defences.ressfl_defense import WindowedSSIM, denormalize
+from util.ae_decoder_metric import WindowedSSIM, denormalize
 from all_attacks.attacks_whitebox import WhiteBoxInversionAttack, AttackMetricsTracker
 from all_attacks.ae_decoder_attack import run_ae_decoder_attack, save_ae_attack_visualization
 from torch.utils.data import TensorDataset, DataLoader

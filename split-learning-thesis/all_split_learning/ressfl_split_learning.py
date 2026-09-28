@@ -9,7 +9,7 @@ import pandas as pd
 import numpy as np
 
 from config import Config
-from all_defences.ressfl_defense import WindowedSSIM, denormalize
+from util.ae_decoder_metric import WindowedSSIM, denormalize
 from all_model.ressfl_models import build_ae
 
 

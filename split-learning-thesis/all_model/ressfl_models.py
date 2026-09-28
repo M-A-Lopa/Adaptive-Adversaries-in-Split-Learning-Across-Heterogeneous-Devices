@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-from all_defences.ressfl_defense import xavier_init
+from util.ae_decoder_metric import xavier_init
 
 
 class ResBlock(nn.Module):

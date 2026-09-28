@@ -10,6 +10,12 @@ from all_model.ressfl_models import custom_AE, xavier_init
 from util.ae_decoder_metric import WindowedSSIM, denormalize
 from config import Config
 
+def _kaiming_init(m):
+    if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+        nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+
 
 class _AEWithBilinearFinal(nn.Module):
 
@@ -21,7 +27,7 @@ class _AEWithBilinearFinal(nn.Module):
                         mode='bilinear', align_corners=False),
             nn.Sigmoid() if activation == 'sigmoid' else nn.Tanh()
         )
-        self.apply(xavier_init)
+        self.apply(_kaiming_init)
 
     def forward(self, x):
         return self.final(self.ae(x))
@@ -38,7 +44,7 @@ def _build_ae_for_shape(smashed_shape, original_channels, original_spatial, acti
     if abs(log2_ratio - round(log2_ratio)) < 0.05:
 
         ae = custom_AE(input_nc=input_nc, output_nc=original_channels, input_dim=input_dim, output_dim=original_spatial, activation=activation)
-        ae.apply(xavier_init)
+        ae.apply(_kaiming_init)
         return ae
     
     else:

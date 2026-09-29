@@ -10,7 +10,7 @@ def get_pyramid_cnn_blocks(in_channels=3):
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2)
         ),
-        nn.Sequential(
+        nn.Sequential(   
             nn.Conv2d(32, 64, kernel_size=3, padding=1, stride=1, bias=False),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),

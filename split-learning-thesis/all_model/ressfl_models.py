@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -46,8 +47,9 @@ class ResBlock(nn.Module):
 
         out = self.conv2(out)
         out += self.shortcut(x)
-        
+
         return out
+
 
 class custom_AE(nn.Module):
     def __init__(self, input_nc=32, output_nc=3,
@@ -61,11 +63,9 @@ class custom_AE(nn.Module):
         nc    = input_nc
 
         for _ in range(upsampling_num - 1):
-            # Spatial: keeps size | Channel: nc → nc//2
             model += [nn.Conv2d(nc, nc // 2, kernel_size=3,
                                 stride=1, padding=1)]
             model += [nn.ReLU()]
-            # Spatial: ×2 | Channel: stays nc//2
             model += [nn.ConvTranspose2d(nc // 2, nc // 2, kernel_size=3,
                                          stride=2, padding=1,
                                          output_padding=1)]
@@ -105,18 +105,41 @@ class custom_AE(nn.Module):
     def forward(self, x):
         return self.m(x)
 
-def build_ae(dataset='CIFAR10', activation='sigmoid'):
 
-    if dataset == 'CIFAR10':
-        ae = custom_AE(input_nc=32, output_nc=3,
-                       input_dim=4, output_dim=32,   
+class _AEWithBilinearFinal(nn.Module):
+
+    def __init__(self, input_nc, output_nc, input_dim, intermediate_dim, target_dim, activation='sigmoid'):
+        super().__init__()
+        self.ae = custom_AE(input_nc=input_nc, output_nc=output_nc,
+                            input_dim=input_dim, output_dim=intermediate_dim,
+                            activation='relu')
+        self.final = nn.Sequential(
+            nn.Upsample(size=(target_dim, target_dim), mode='bilinear', align_corners=False),
+            nn.Sigmoid() if activation == 'sigmoid' else nn.Tanh()
+        )
+        self.apply(xavier_init)
+
+    def forward(self, x):
+        return self.final(self.ae(x))
+
+
+def build_ae(smashed_shape, dataset='CIFAR10', activation='sigmoid'):
+    _, input_nc, input_dim, _ = smashed_shape
+    output_nc  = 1 if dataset == 'MNIST' else 3
+    output_dim = 28 if dataset == 'MNIST' else 32
+
+    ratio = output_dim / input_dim
+    log2_ratio = math.log2(ratio)
+
+    if abs(log2_ratio - round(log2_ratio)) < 0.05:
+        ae = custom_AE(input_nc=input_nc, output_nc=output_nc,
+                       input_dim=input_dim, output_dim=output_dim,
                        activation=activation)
-    elif dataset == 'MNIST':
-        ae = custom_AE(input_nc=32, output_nc=1,
-                       input_dim=3, output_dim=28,   
-                       activation=activation)
+        ae.apply(xavier_init)
+        return ae
     else:
-        raise ValueError(f"Unsupported dataset: {dataset}")
-
-    ae.apply(xavier_init)
-    return ae
+        upsample_steps = int(log2_ratio)
+        intermediate_dim = input_dim * (2 ** upsample_steps)
+        return _AEWithBilinearFinal(input_nc=input_nc, output_nc=output_nc,
+                                    input_dim=input_dim, intermediate_dim=intermediate_dim,
+                                    target_dim=output_dim, activation=activation)

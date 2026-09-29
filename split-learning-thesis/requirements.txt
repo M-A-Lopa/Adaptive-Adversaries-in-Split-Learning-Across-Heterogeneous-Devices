@@ -1,12 +1,16 @@
 
 # requirements.txt
 # Python 3.11.9 compatible — tested stack for Split Learning thesis
+#download 3.11.9 from https://www.python.org/downloads/release/python-3119/
+# write - py -3.11 -m venv .venv
+# write - .\.venv\Scripts\Activate.ps1
+# install - python -m pip install --upgrade pip
 # Install with: pip install -r requirements.txt
 
 # ── PyTorch (install separately via torch index URL) ──
-# torch==2.3.1
-# torchvision==0.18.1
-# torchaudio==2.3.1
+torch==2.3.1
+torchvision==0.18.1
+torchaudio==2.3.1
 
 # ── Scientific computing ──────────────────────────────
 numpy==1.26.4

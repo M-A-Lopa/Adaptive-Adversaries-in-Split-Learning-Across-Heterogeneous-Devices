@@ -211,7 +211,7 @@ class UnSplitAttack:
         clone_model.eval()
         return x_pred.detach()
 
-    def run_attack(self, data_loader, num_batches=20):
+    def run_attack(self, data_loader, num_batches=20, tag='no_defense'):
 
         print(f"\n  Running UnSplit attack on {num_batches} batches...")
         print(f"  Main/input/model iters: {self.main_iters}/{self.input_iters}/{self.model_iters}")
@@ -260,14 +260,12 @@ class UnSplitAttack:
         mean_mse  = float(np.mean(all_mse))
 
         print("\n" + "="*60)
-        print("   UNSPLIT ATTACK — RESULTS (NO DEFENSE)")
+        print("   UNSPLIT ATTACK — RESULTS")
         print("="*60)
         print(f"  MSE  : {mean_mse:.5f}")
         print(f"  PSNR : {mean_psnr:.2f} dB")
         print(f"  SSIM : {mean_ssim:.4f}")
         print("="*60)
-        print("  These are your BASELINE attack numbers.")
-        print("  After defense: MSE should increase, while PSNR and SSIM should decrease.")
 
         self._save_visualization(originals_store, reconstructed_store, tag='no_defense')
 

@@ -25,15 +25,15 @@ class WarmUpLR(lr_scheduler._LRScheduler):
         ]
 
 class ResSFLTrainer:
-    WARM_EPOCHS  = 1      
-    GAN_NUM_STEP = 3     
-    AE_INTERVAL  = 1    
-    ALPHA2       = 1.0   
-    SSIM_THRESH  = 0.4   
-    SGD_LR       = 0.1   
+    WARM_EPOCHS  = 1
+    GAN_NUM_STEP = 3
+    AE_INTERVAL  = 1
+    ALPHA2       = 1.0
+    SSIM_THRESH  = 0.4
+    SGD_LR       = 0.1
     SGD_MOMENTUM = 0.9
     SGD_WD       = 5e-4
-    AE_LR        = 1e-3   
+    AE_LR        = 1e-3
 
     def __init__(self, client_model, server_model, train_loader, test_loader):
         self.device = torch.device(Config.DEVICE if torch.cuda.is_available() else 'cpu')
@@ -45,10 +45,17 @@ class ResSFLTrainer:
         self.test_loader  = test_loader
         self.dataset      = Config.DATASET
 
-        self.local_ae = build_ae(dataset=self.dataset,
+        in_channels = 1 if self.dataset == 'MNIST' else 3
+        image_size  = 28 if self.dataset == 'MNIST' else 32
+        with torch.no_grad():
+            dummy = torch.zeros(1, in_channels, image_size, image_size, device=self.device)
+            smashed_shape = self.client_model(dummy).shape
+
+        self.local_ae = build_ae(smashed_shape=smashed_shape, dataset=self.dataset,
                                  activation='sigmoid').to(self.device)
         print(f"  AE decoder parameters: "
               f"{sum(p.numel() for p in self.local_ae.parameters()):,}")
+        print(f"  Smashed shape used for AE: {tuple(smashed_shape[1:])}")
 
         self.server_optimizer = optim.SGD(self.server_model.parameters(), lr=self.SGD_LR, momentum=self.SGD_MOMENTUM, weight_decay=self.SGD_WD)
         self.client_optimizer = optim.SGD(self.client_model.parameters(), lr=self.SGD_LR, momentum=self.SGD_MOMENTUM, weight_decay=self.SGD_WD)
@@ -108,7 +115,7 @@ class ResSFLTrainer:
         ae_train = DataLoader(TensorDataset(all_imgs[:n_train], all_smashed[:n_train]), batch_size=ae_batch_size, shuffle=True)
         ae_val = DataLoader(TensorDataset(all_imgs[n_train:], all_smashed[n_train:]), batch_size=ae_batch_size, shuffle=False)
 
-        pre_criterion = nn.MSELoss() 
+        pre_criterion = nn.MSELoss()
         pre_optimizer = optim.Adam(self.local_ae.parameters(), lr=self.AE_LR)
 
         best_val_mse  = float('inf')
@@ -183,14 +190,14 @@ class ResSFLTrainer:
         self.client_optimizer.zero_grad()
         self.server_optimizer.zero_grad()
 
-        z      = self.client_model(inputs)  
-        output = self.server_model(z)     
+        z      = self.client_model(inputs)
+        output = self.server_model(z)
 
         ce_loss    = self.criterion(output, labels)
         total_loss = ce_loss
 
         self.local_ae.eval()
-        recon    = self.local_ae(z) 
+        recon    = self.local_ae(z)
         x_denorm = denormalize(inputs, self.dataset)
         ssim_val = self.ssim_loss(recon, x_denorm)
 
@@ -279,7 +286,9 @@ class ResSFLTrainer:
         print("\n" + "="*60)
         print("   RESSFL SPLIT LEARNING — TRAINING")
         print("="*60)
+        print(f"  Model         : {Config.MODEL_NAME}")
         print(f"  Dataset       : {Config.DATASET}")
+        print(f"  Cut layer     : {Config.CUT_LAYER}")
         print(f"  Epochs        : {Config.EPOCHS}")
         print(f"  SGD LR        : {self.SGD_LR}")
         print(f"  AE LR         : {self.AE_LR}")
@@ -318,7 +327,7 @@ class ResSFLTrainer:
         return self.train_losses, self.train_accuracies, self.test_accuracies
 
     def _save_checkpoint(self, epoch, best_acc):
-        path = f"{Config.SAVE_DIR}/best_ressfl_{Config.DATASET}.pth"
+        path = f"{Config.SAVE_DIR}/best_ressfl_{Config.MODEL_NAME.lower()}_{Config.DATASET}.pth"
         torch.save({
             'epoch'        : epoch,
             'client_state' : self.client_model.state_dict(),
@@ -327,6 +336,8 @@ class ResSFLTrainer:
             'best_acc'     : best_acc,
             'dataset'      : Config.DATASET,
             'model_type'   : 'ResSFL',
+            'model_name'   : Config.MODEL_NAME,
+            'cut_layer'    : Config.CUT_LAYER,
             'ssim_threshold': self.SSIM_THRESH,
             'alpha2'       : self.ALPHA2}, path)
 
@@ -336,6 +347,6 @@ class ResSFLTrainer:
             'train_loss'    : self.train_losses,
             'train_accuracy': self.train_accuracies,
             'test_accuracy' : self.test_accuracies})
-        path = f"{Config.RESULTS_DIR}/ressfl_results_{Config.DATASET}.csv"
+        path = f"{Config.RESULTS_DIR}/ressfl_results_{Config.MODEL_NAME.lower()}_{Config.DATASET}.csv"
         df.to_csv(path, index=False)
         print(f"  Results saved → {path}")

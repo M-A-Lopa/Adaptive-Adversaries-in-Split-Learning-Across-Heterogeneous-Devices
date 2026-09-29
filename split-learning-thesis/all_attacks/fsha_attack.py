@@ -246,7 +246,7 @@ class FSHAAttack:
 
         print("\n  Hijacking complete.")
 
-    def reconstruct(self, test_loader, num_images=32):
+    def reconstruct(self, test_loader, num_images=32, tag='no_defense'):
         self.client_model.eval()
         self.decoder.eval()
 
@@ -285,7 +285,7 @@ class FSHAAttack:
         print(f"  SSIM : {summary['ssim']:.4f}")
         print("=" * 60)
 
-        self._save_visualization(originals_store, reconstructed_store, tag='no_defense')
+        self._save_visualization(originals_store, reconstructed_store, tag=tag)
         return summary
 
     def _save_visualization(self, originals, reconstructed, tag='result'):

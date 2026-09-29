@@ -8,14 +8,14 @@ class Config:
     EPOCHS        = 50
     LEARNING_RATE = 0.001
 
-    CUT_LAYER     = 4
+    CUT_LAYER     = 2
 
     DEVICE        = 'cuda' 
 
     SAVE_DIR      = './checkpoints'
     RESULTS_DIR   = './results'
     
-    MODEL_NAME    = "PyramidCNN" #change to "PyramidCNN"/"Vanilla_SL/KAGN" to switch models
+    MODEL_NAME    = "KAGN" #change to "PyramidCNN"/"Vanilla_SL/KAGN" to switch models
     RUN_ATTACK    = True # change to True when you want to run the attacks otherwise False
     DEGREE        = 3 # Degree for KAGN model, only relevant if MODEL_NAME is "KAGN"
 

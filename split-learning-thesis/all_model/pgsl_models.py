@@ -1,27 +1,43 @@
 import torch
 import torch.nn as nn
-from all_defences.pgsl_defense import (PGSLProximalRecoveryBlock, ConvolutionSumFusion)
+from config import Config
+from all_defences.pgsl_defense import PGSLProximalRecoveryBlock, ConvolutionSumFusion
+from all_model.kagn_models import KAGNClientModel
+from all_model.pyramid_cnn import PyramidCNNClientModel
+from all_model.models import ClientModel
+
+
+def build_pgsl_client(original_in_channels=3):
+    pgsl_in_channels = 4 * original_in_channels + 1
+
+    if Config.MODEL_NAME == "KAGN":
+        return KAGNClientModel(cut_layer=Config.CUT_LAYER, in_channels=pgsl_in_channels, degree=Config.DEGREE)
+    elif Config.MODEL_NAME == "PyramidCNN":
+        return PyramidCNNClientModel(cut_layer=Config.CUT_LAYER, in_channels=pgsl_in_channels)
+    else:
+        return ClientModel(in_channels=pgsl_in_channels)
 
 
 class PGSLClientModel(nn.Module):
     def __init__(self, original_in_channels=1):
         super(PGSLClientModel, self).__init__()
-
-        pgsl_in_channels = 4 * original_in_channels + 1
-
-        self.conv1 = nn.Sequential(nn.Conv2d(pgsl_in_channels, 16, kernel_size=3, padding=1), nn.BatchNorm2d(16), nn.ReLU(), nn.MaxPool2d(kernel_size=2, stride=2))
-
-        self.conv2 = nn.Sequential( nn.Conv2d(16, 32, kernel_size=3, padding=1), nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(kernel_size=2, stride=2))
+        self.base = build_pgsl_client(original_in_channels)
 
     def forward(self, x):
-        x = self.conv1(x)
-        x = self.conv2(x)
-        return x 
+        return self.base(x)
 
 
 class PGSLServerModel(nn.Module):
-    def __init__(self, num_classes=10, smashed_channels=32):
+    def __init__(self, num_classes=10, smashed_channels=None, smashed_shape=None):
         super(PGSLServerModel, self).__init__()
+        if smashed_channels is None:
+            if smashed_shape is None:
+                raise ValueError(
+                    "PGSLServerModel needs smashed_channels or smashed_shape -- "
+                    "KAGN/PyramidCNN change the client's output channel count "
+                    "with Config.CUT_LAYER, so it can no longer be hardcoded to 32."
+                )
+            smashed_channels = smashed_shape[1]
 
         self.recovery = PGSLProximalRecoveryBlock(mu=0.55)
         self.fusion   = ConvolutionSumFusion(smashed_channels)
@@ -35,14 +51,14 @@ class PGSLServerModel(nn.Module):
         self.classifier_f = self._make_classifier(num_classes)
 
     def _make_backbone(self, in_channels):
-        return nn.Sequential( nn.Conv2d(in_channels, 64, kernel_size=3, padding=1), nn.BatchNorm2d(64), nn.ReLU(), nn.AdaptiveAvgPool2d((4, 4)))
+        return nn.Sequential(nn.Conv2d(in_channels, 64, kernel_size=3, padding=1),
+                             nn.BatchNorm2d(64), nn.ReLU(), nn.AdaptiveAvgPool2d((4, 4)))
 
     def _make_classifier(self, num_classes):
-        
-        return nn.Sequential(nn.Flatten(), nn.Linear(64 * 4 * 4, 256), nn.ReLU(), nn.Dropout(p=0.3), nn.Linear(256, num_classes))
+        return nn.Sequential(nn.Flatten(), nn.Linear(64 * 4 * 4, 256), nn.ReLU(),
+                             nn.Dropout(p=0.3), nn.Linear(256, num_classes))
 
     def forward(self, smashed_data, run_full_pipeline=True):
-
         features_a = self.stream_a(smashed_data)
         out_a      = self.classifier_a(features_a)
 

@@ -2,7 +2,7 @@ import torch
 
 from config import Config
 from all_defences.r3elu_defense import R3eLUMechanism, clip_k, rr_probability, sample_laplace
-from defence_runner.ablation import abl_common as C
+import abl_common as C
 
 
 class AblR3eLUMechanism(R3eLUMechanism):

@@ -8,7 +8,7 @@ from config import Config
 from all_defences.splitml_defense import SplitMLDefense
 from all_split_learning.splitml_federated_learning import (SplitMLTrainer, SplitMLClientModel,
                                                            build_splitml_clients)
-from defence_runner.ablation import abl_common as C
+import abl_common as C
 
 
 def homogeneous_clients(k, device):

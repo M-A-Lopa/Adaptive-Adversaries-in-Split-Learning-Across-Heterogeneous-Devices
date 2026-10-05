@@ -1,7 +1,7 @@
 import torch
 
 from all_defences.splitfss_defense import FixedPoint, CryptoProvider, rand_ring
-from defence_runner.ablation import abl_common as C
+import abl_common as C
 
 
 class FSSViews:

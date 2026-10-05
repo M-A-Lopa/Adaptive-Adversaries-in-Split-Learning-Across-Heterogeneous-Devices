@@ -7,9 +7,24 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _find_root(start):
+    d = start
+    while True:
+        if os.path.exists(os.path.join(d, 'config.py')) and os.path.isdir(os.path.join(d, 'all_attacks')):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            raise RuntimeError(f"could not find the project root (folder with config.py) above {start}")
+        d = parent
+
+
+ROOT = _find_root(HERE)
+for _p in (ROOT, HERE):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from config import Config
 from dataset import DatasetLoader

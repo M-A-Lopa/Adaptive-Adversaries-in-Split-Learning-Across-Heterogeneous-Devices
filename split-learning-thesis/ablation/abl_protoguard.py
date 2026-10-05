@@ -1,7 +1,7 @@
 import torch
 
 from all_defences.protoguard_sl_defense import ProtoGuardSLDefense
-from defence_runner.ablation import abl_common as C
+import abl_common as C
 
 
 class AblProtoGuard(ProtoGuardSLDefense):

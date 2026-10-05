@@ -1,23 +1,4 @@
-"""
-ZORRO vs. the 8 attacks (same attack parameters as run_safesplit.py / unified_defence_run.py).
 
-Protocol (identical to the SafeSplit runner so the rows are comparable):
-  * single client, one turn = one training epoch
-  * benign training with ZORRO in the loop -> checkpoint
-  * attack phase: queue initialised with k benign turns from the checkpoint (paper Sec 4.4,
-    "pretrained, obtained via benign rounds"), then every attacker epoch is a ZORRO turn:
-        start from BM -> train one epoch -> score k+1 updates -> prune argmax -> new BM
-  * ASR / CDA are measured on the BM model (the one the next client continues from)
-
-ZORRO hooks into VILLAIN (injection phase) and BackdoorPoison_Client only. It inspects model
-updates and does not alter smashed data, so the reconstruction / label-leakage attacks run on the
-ZORRO-trained checkpoint without a hook (as for SafeSplit).
-
-Ablation: every component is a flag, outputs are tagged with --variant.
-  python defence_runner/run_zorro.py                                     # full ZORRO
-  python defence_runner/run_zorro.py --variant no_dct --transform none --attacks VILLAIN,BackdoorPoison_Client
-  python defence_runner/run_zorro.py --variant cheat_nozkp --cheat --no-zkp --attacks BackdoorPoison_Client
-"""
 import os
 import sys
 import time
@@ -84,9 +65,6 @@ def materialize_lazy(client, server, device, in_channels=3, image_size=32):
     client.train(was[0]); server.train(was[1])
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  Defense construction from CLI flags
-# ═════════════════════════════════════════════════════════════════════════════
 def make_defense(args, device):
     return ZORRODefense(k=args.k, beta=args.beta, transform=args.transform, band=args.band,
                         metric=args.metric, rollback=not args.no_rollback, commit=not args.no_commit,
@@ -100,7 +78,6 @@ def load_bm(defense, client, server):
 
 
 def zorro_turn(defense, turn, client_id, client, server, run_epoch, poisoned, cheat=False):
-    """One ZORRO turn: start from BM, train, score, prune, update BM, load BM."""
     load_bm(defense, client, server)
     before = defense.inspected_vector(client, server)
     run_epoch()

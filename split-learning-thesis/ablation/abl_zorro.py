@@ -5,7 +5,7 @@ import sys
 import pandas as pd
 
 from config import Config
-from defence_runner.ablation import abl_common as C
+import abl_common as C
 
 ATTACK_NAME = {'poison_client': 'BackdoorPoison_Client', 'villain': 'VILLAIN'}
 
@@ -36,10 +36,25 @@ class ZorroAblation:
         tag = f"{Config.MODEL_NAME.lower()}_cut{Config.CUT_LAYER}_{Config.DATASET}_{variant}"
         return f"{Config.RESULTS_DIR}/zorro_all_attacks_{tag}.csv"
 
+    def _check_runner(self, script):
+        if not os.path.isfile(script):
+            raise FileNotFoundError(f"run_zorro.py not found at {script}")
+        text = open(script, encoding='utf-8', errors='ignore').read()
+        needed = {'--variant', '--attacks', '--model', '--cut'}
+        for flags in self.variants.values():
+            needed.update(f for f in flags if f.startswith('--'))
+        missing = sorted(f for f in needed if f"'{f}'" not in text and f'"{f}"' not in text)
+        if missing:
+            raise RuntimeError(f"your run_zorro.py does not support {missing}; the ZORRO ablation needs them")
+        return "'--dataset'" in text or '"--dataset"' in text
+
     def _launch(self, variant, attacks):
         script = os.path.join(C.ROOT, 'defence_runner', 'run_zorro.py')
+        has_dataset = self._check_runner(script)
         cmd = [sys.executable, script, '--model', Config.MODEL_NAME, '--cut', str(Config.CUT_LAYER),
-               '--dataset', Config.DATASET, '--variant', variant] + self.variants[variant]
+               '--variant', variant] + self.variants[variant]
+        if has_dataset:
+            cmd += ['--dataset', Config.DATASET]
         if attacks is not None:
             cmd += ['--attacks', ','.join(attacks)]
         print('[ablation] ' + ' '.join(cmd))

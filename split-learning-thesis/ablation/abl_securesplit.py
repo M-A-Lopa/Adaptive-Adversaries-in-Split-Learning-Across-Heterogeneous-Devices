@@ -4,7 +4,7 @@ import warnings
 import numpy as np
 import torch
 
-from defence_runner.ablation import abl_common as C
+import abl_common as C
 
 try:
     import umap

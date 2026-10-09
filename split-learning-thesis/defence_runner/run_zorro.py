@@ -1,4 +1,3 @@
-
 import os
 import sys
 import time
@@ -388,7 +387,7 @@ if __name__ == "__main__":
                                     beta=TRIGGER_BETA, trigger_fraction=TRIGGER_FRACTION, dropout_keep=DROPOUT_KEEP,
                                     gamma_low=GAMMA_LOW, gamma_high=GAMMA_HIGH, poison_rate=POISON_RATE,
                                     candidates_per_batch=CANDIDATES)
-        atk.warmup(idx_loader, epochs=WARMUP_EPOCHS)         
+        atk.warmup(idx_loader, epochs=WARMUP_EPOCHS)
         base, _ = atk.evaluate(test_loader)
         atk.infer_labels(idx_loader, epochs=INFERENCE_EPOCHS)
         atk.fabricate_trigger(idx_loader)
@@ -458,7 +457,6 @@ if __name__ == "__main__":
     run_attack('VILLAIN', 'VILLAIN BACKDOOR ATTACK', attack_villain)
     run_attack('BackdoorPoison_Client', 'BACKDOOR POISONING (CLIENT)', attack_backdoor('client'))
     run_attack('BackdoorPoison_Server', 'BACKDOOR POISONING (SERVER)', attack_backdoor('server'))
-
 
     METRICS = {'WhiteBox': {'psnr': 'mean_psnr', 'ssim': 'mean_ssim'}, 'UnSplit': {'psnr': 'psnr', 'ssim': 'ssim'},
                'AE_Decoder': {'psnr': 'mean_psnr', 'ssim': 'mean_ssim'},

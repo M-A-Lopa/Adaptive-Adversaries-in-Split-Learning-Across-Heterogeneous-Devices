@@ -58,7 +58,12 @@ class ZorroAblation:
         if attacks is not None:
             cmd += ['--attacks', ','.join(attacks)]
         print('[ablation] ' + ' '.join(cmd))
-        subprocess.run(cmd, cwd=C.ROOT, check=True)
+        p = subprocess.run(cmd, cwd=C.ROOT, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
+        if p.stderr:
+            print(p.stderr)
+        if p.returncode != 0:
+            tail = ' | '.join(p.stderr.strip().splitlines()[-6:])
+            raise RuntimeError(f"run_zorro.py failed ({p.returncode}): {tail}")
 
     def run(self, variant, attack, ctx):
         path = self._csv(variant)

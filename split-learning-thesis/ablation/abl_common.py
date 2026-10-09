@@ -192,12 +192,13 @@ def load_vanilla(device):
 class LabelHolder:
     def __init__(self):
         self.labels = None
+        self.poison = None
 
     def set(self, y):
         self.labels = y.detach() if torch.is_tensor(y) else torch.as_tensor(y)
 
     def get(self, n, device):
-        if self.labels is None:
+        if self.labels is None or self.labels.shape[0] < n:
             return None
         return self.labels[:n].to(device)
 
@@ -212,6 +213,7 @@ class Tapped:
     def __iter__(self):
         for b in self.loader:
             HOLDER.set(b[1])
+            HOLDER.poison = None
             yield b
 
     def __len__(self):
@@ -273,7 +275,7 @@ def atk_label_leakage(server_wrap, train_dataset, device):
     return {'auc': auc, 'acc': 100.0 * correct / max(total, 1)}
 
 
-def atk_poison_client(server_wrap, train_loader, test_loader, device, tag):
+def atk_poison_client(server_wrap, train_loader, test_loader, device, tag, eval_defense=None):
     from all_attacks.backdoor_poison_attack import BackdoorPoisonAttack
     seed_all(0)
     train_vanilla(device)
@@ -291,13 +293,14 @@ def atk_poison_client(server_wrap, train_loader, test_loader, device, tag):
     def poison_and_tap(x, y):
         out = original(x, y)
         HOLDER.set(out[1])
+        HOLDER.poison = out[2] if len(out) > 2 else None
         return out
 
     atk._poison_batch = poison_and_tap
     if server_wrap is not None:
         atk.server_model = server_wrap(atk.server_model, atk)
     atk.train(Tapped(train_loader), test_loader, epochs=SETTINGS['attack_epochs'])
-    cda, asr = atk.evaluate(Tapped(test_loader))
+    cda, asr = atk.evaluate(test_loader, defense=eval_defense)
     return {'asr': float(asr), 'acc': float(cda)}
 
 
@@ -310,6 +313,29 @@ class DropServer(nn.Module):
         self.eval_view = eval_view
         self.seen = 0
         self.rejected = 0
+        self.poison_seen = 0
+        self.poison_rejected = 0
+
+    def _poison_mask(self, n, device):
+        pm = HOLDER.poison
+        if pm is None:
+            return None
+        pm = torch.as_tensor(pm, device=device)
+        if pm.dtype != torch.bool:
+            if pm.numel() == n and set(pm.unique().tolist()) <= {0, 1}:
+                pm = pm.bool()
+            else:
+                full = torch.zeros(n, dtype=torch.bool, device=device)
+                full[pm.long()] = True
+                pm = full
+        return pm if pm.numel() == n else None
+
+    def stats(self):
+        benign_seen = self.seen - self.poison_seen
+        return {'rejected_pct': 100.0 * self.rejected / max(self.seen, 1),
+                'poison_rejected_pct': 100.0 * self.poison_rejected / max(self.poison_seen, 1) if self.poison_seen else None,
+                'benign_rejected_pct': 100.0 * (self.rejected - self.poison_rejected) / max(benign_seen, 1)
+                if self.poison_seen else None}
 
     def forward(self, z):
         training = torch.is_grad_enabled() and z.requires_grad
@@ -320,10 +346,15 @@ class DropServer(nn.Module):
         mask = self.reject_fn(z.detach(), HOLDER.get(z.shape[0], z.device))
         out = self.server(z)
         self.seen += z.shape[0]
+        pm = self._poison_mask(z.shape[0], out.device)
+        if pm is not None:
+            self.poison_seen += int(pm.sum())
         if mask is None or not bool(mask.any()):
             return out
         mask = mask.to(out.device)
         self.rejected += int(mask.sum())
+        if pm is not None:
+            self.poison_rejected += int((mask & pm).sum())
         return torch.where(mask.view(-1, *([1] * (out.dim() - 1))), out.detach(), out)
 
 

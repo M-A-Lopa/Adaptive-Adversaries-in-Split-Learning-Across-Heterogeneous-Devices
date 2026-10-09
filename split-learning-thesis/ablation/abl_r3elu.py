@@ -56,7 +56,7 @@ class AblR3eLUMechanism(R3eLUMechanism):
 
 class R3eLUAblation:
     name = 'r3elu'
-    attacks = ['whitebox', 'ae_decoder', 'label_leakage']
+    attacks = ['whitebox', 'ae_decoder', 'label_leakage', 'fsha']
 
     def __init__(self, epsilon=1.0, sensitivity='global'):
         self.epsilon, self.sensitivity = epsilon, sensitivity
@@ -78,7 +78,7 @@ class R3eLUAblation:
         return AblR3eLUMechanism(nf, epsilon=self.epsilon, K=nf // 2, C=10.0, device=device, **cfg)
 
     def _trained(self, variant, ctx):
-        key = ('r3elu', variant)
+        key = ('r3elu', self.epsilon, self.sensitivity, variant)
         if key in ctx['cache']:
             return ctx['cache'][key]
         from all_split_learning.r3elu_split_learning import R3eLUSplitLearningTrainer
@@ -87,7 +87,7 @@ class R3eLUAblation:
         mech = self.mech(self.variants[variant], C.n_features(c, dev), dev)
         old = Config.EPOCHS
         Config.EPOCHS = C.SETTINGS['def_epochs']
-        tr = R3eLUSplitLearningTrainer(c, s, ctx['train'], ctx['test'], mech, tag=f"abl_r3elu_{variant}")
+        tr = R3eLUSplitLearningTrainer(c, s, ctx['train'], ctx['test'], mech, tag=f"abl_r3elu_eps{self.epsilon:g}_{variant}")
         tr._save_checkpoint = lambda *a, **k: None
         tr.train()
         Config.EPOCHS = old
@@ -104,6 +104,10 @@ class R3eLUAblation:
             def wrap(server, client):
                 return R3eLUProtectedServer(server, self.mech(cfg, C.n_features(client, dev), dev))
             return C.atk_label_leakage(wrap, ctx['train'].dataset, dev)
+        if attack == 'fsha':
+            r = self._fsha(variant, ctx)
+            r['acc'] = self._trained(variant, ctx)[2]
+            return r
         client, mech, acc = self._trained(variant, ctx)
         view = (lambda z, y: mech.forward_perturb(z)) if mech.protect_forward else (lambda z, y: z)
         if attack == 'whitebox':
@@ -112,3 +116,31 @@ class R3eLUAblation:
             r = C.atk_ae(client, view, ctx['train'], ctx['test'], dev)
         r['acc'] = acc
         return r
+
+    def _fsha(self, variant, ctx):
+        from defence_runner.run_splitfss_evaluation import DefendedFSHAAttack
+        dev = ctx['device']
+        cfg = self.variants[variant]
+        probe = C.build_client(dev)
+        mech = self.mech(cfg, C.n_features(probe, dev), dev)
+        del probe
+
+        class R3eLUFSHAAttack(DefendedFSHAAttack):
+            def _observed(self, smashed):
+                out = smashed + (self.view_fn(smashed) - smashed).detach()
+                if mech.protect_backward and out.requires_grad:
+                    observed = out.detach()
+
+                    def hook(g):
+                        mech.importance.update(observed, g)
+                        return mech.backward_perturb(g)
+                    out.register_hook(hook)
+                return out
+
+        view = (lambda z: mech.forward_perturb(z)) if mech.protect_forward else (lambda z: z)
+        attack = R3eLUFSHAAttack(client_model=C.build_client(), in_channels=C.in_ch(), dataset=Config.DATASET,
+                                 pilot_builder=C.build_client, critic_iters=5, view_fn=view,
+                                 tag=f"abl_r3elu_eps{self.epsilon:g}_{variant}")
+        attack.hijack(C.Tapped(ctx['train']), ctx['test'], epochs=C.SETTINGS['fsha_epochs'])
+        s = attack.reconstruct(ctx['train'], num_images=C.SETTINGS['max_images'])
+        return {'ssim': float(s['ssim']), 'psnr': float(s['psnr'])}

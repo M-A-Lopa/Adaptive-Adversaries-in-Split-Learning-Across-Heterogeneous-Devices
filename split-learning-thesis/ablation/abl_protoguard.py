@@ -98,6 +98,14 @@ class AblProtoGuard(ProtoGuardSLDefense):
         return self.replace(z, labels) if self.action == 'replace' else z
 
 
+class TestTimeFilter:
+    def __init__(self, pg):
+        self.pg = pg
+
+    def protect(self, z, labels):
+        return self.pg.replace(z, labels)
+
+
 class ProtoGuardAblation:
     name = 'protoguard'
     attacks = ['whitebox', 'ae_decoder', 'fsha', 'poison_client']
@@ -160,15 +168,15 @@ class ProtoGuardAblation:
         def wrap(server, atk):
             pf = atk._poison_batch if cfg['fit'] == 'stream' else None
             pg.fit(atk.client_model, ctx['train'], dev, poison_fn=pf)
-            tv = pg.replace if cfg['filter_at_test'] and cfg['action'] == 'replace' else None
             if cfg['action'] == 'replace':
-                w = C.ReplaceServer(server, pg.replace, eval_view=tv)
+                w = C.ReplaceServer(server, pg.replace, eval_view=None)
             else:
                 w = C.DropServer(server, pg.flagged, eval_view=None)
             holder['w'] = w
             return w
 
-        r = C.atk_poison_client(wrap, ctx['train'], ctx['test'], dev, f'abl_pg_{variant}')
+        test_filter = TestTimeFilter(pg) if cfg['filter_at_test'] and cfg['action'] == 'replace' else None
+        r = C.atk_poison_client(wrap, ctx['train'], ctx['test'], dev, f'abl_pg_{variant}', eval_defense=test_filter)
         w = holder.get('w')
         if isinstance(w, C.DropServer):
             r['rejected_pct'] = 100.0 * w.rejected / max(w.seen, 1)

@@ -8,9 +8,6 @@ from typing import Dict, List, Optional, Tuple
 from copy import deepcopy
 
 
-# ─────────────────────────────────────────────────────────────
-# Component 1: DCT-based Static Frequency Analysis
-# ─────────────────────────────────────────────────────────────
 
 class FrequencyAnalyzer:
     
@@ -36,22 +33,21 @@ class FrequencyAnalyzer:
     
         params_np = model_params.detach().cpu().float().numpy().flatten()
     
-        # 2D DCT के लिए reshape
         n = len(params_np)
         side = int(np.sqrt(n))
 
         if side * side < n:
-            side += 1  # Increase side to make a bigger square
+            side += 1  
 
-        # Now pad to side*side
+       
         padded = np.zeros(side * side)
         padded[:n] = params_np
         params_2d = padded.reshape(side, side)
     
-        # Compute 2D DCT
+       
         dct_2d = dct(dct(params_2d, axis=0), axis=1)
     
-        # Low-frequency component (top-left corner)
+  
         k = max(1, int(min(params_2d.shape) * self.low_freq_ratio))
         low_freq = dct_2d[:k, :k].flatten()
     
@@ -59,10 +55,10 @@ class FrequencyAnalyzer:
     
     def save_checkpoint(self, server_model: nn.Module):
         
-        # Key layer parameters collect করো
+    
         checkpoint_params = {}
         for name, param in server_model.named_parameters():
-            if 'weight' in name:  # Weight layers only
+            if 'weight' in name:  
                 checkpoint_params[name] = param.data.clone()
         
         self._checkpoint = checkpoint_params
@@ -83,18 +79,18 @@ class FrequencyAnalyzer:
             if name not in self._checkpoint or 'weight' not in name:
                 continue
             
-            # Current DCT low-freq
+            
             curr_low = self._get_dct_low_freq(param.data)
             
-            # Checkpoint DCT low-freq
+           
             prev_low = self._get_dct_low_freq(self._checkpoint[name])
             
-            # Ensure same length
+           
             min_len = min(len(curr_low), len(prev_low))
             curr_low = curr_low[:min_len]
             prev_low = prev_low[:min_len]
             
-            # Euclidean distance in frequency domain
+           
             dist = np.linalg.norm(curr_low - prev_low)
             total_distance += dist
             n_layers += 1
@@ -102,13 +98,13 @@ class FrequencyAnalyzer:
         avg_distance = total_distance / max(1, n_layers)
         self._distance_history.append(avg_distance)
         
-        # Z-score based anomaly detection
+     
         anomaly_score = 0.0
         is_anomalous = False
         
         if len(self._distance_history) >= 3:
             recent = self._distance_history[-self.window_size:]
-            mean_d = np.mean(recent[:-1])  # Exclude current
+            mean_d = np.mean(recent[:-1])  
             std_d = np.std(recent[:-1]) + 1e-8
             anomaly_score = (avg_distance - mean_d) / std_d
             
@@ -120,10 +116,6 @@ class FrequencyAnalyzer:
             'anomaly_score': anomaly_score
         }
 
-
-# ─────────────────────────────────────────────────────────────
-# Component 2: Rotational Distance Metric (Dynamic Analysis)
-# ─────────────────────────────────────────────────────────────
 
 class RotationalDistanceAnalyzer:
     
@@ -159,7 +151,6 @@ class RotationalDistanceAnalyzer:
             torch.norm(v1_flat) * torch.norm(v2_flat) + 1e-8
         )
         
-        # Clamp to [-1, 1] for numerical stability
         cos_sim = torch.clamp(cos_sim, -1.0, 1.0)
         angle = torch.acos(cos_sim).item() * 180 / np.pi
         
@@ -198,7 +189,6 @@ class RotationalDistanceAnalyzer:
         
         self._rotation_history.append(mean_rotation)
         
-        # Z-score anomaly detection
         anomaly_score = 0.0
         is_anomalous = False
         
@@ -217,17 +207,13 @@ class RotationalDistanceAnalyzer:
         }
 
 
-# ─────────────────────────────────────────────────────────────
-# Component 3: Circular Backward Analysis (Rollback)
-# ─────────────────────────────────────────────────────────────
-
 class CircularBackwardAnalysis:
     
     
     def __init__(self, max_checkpoints: int = 5):
         self.max_checkpoints = max_checkpoints
-        self._checkpoints = []  # [(epoch, client_id, state_dict)]
-        self._flagged_clients = {}  # client_id → flagged_epoch
+        self._checkpoints = []  
+        self._flagged_clients = {}  
         self._rollback_count = 0
         
         print(f"[SafeSplit] CircularBackward: "
@@ -241,14 +227,12 @@ class CircularBackwardAnalysis:
         state = deepcopy(server_model.state_dict())
         self._checkpoints.append((epoch, client_id, state))
         
-        # Keep only recent checkpoints
         if len(self._checkpoints) > self.max_checkpoints:
             self._checkpoints.pop(0)
     
     def rollback(self, server_model: nn.Module,
                  epoch: int, client_id: int) -> bool:
         
-        # Find checkpoint before this client's training
         target_checkpoint = None
         for ckpt_epoch, ckpt_client, state in reversed(self._checkpoints):
             if ckpt_client == client_id and ckpt_epoch == epoch:
@@ -260,7 +244,6 @@ class CircularBackwardAnalysis:
                   f"client {client_id} epoch {epoch}")
             return False
         
-        # Restore server model
         server_model.load_state_dict(target_checkpoint)
         self._rollback_count += 1
         
@@ -269,25 +252,18 @@ class CircularBackwardAnalysis:
         return True
     
     def flag_client(self, client_id: int, epoch: int):
-        """Client কে flag করো — এই epoch skip করবে।"""
         self._flagged_clients[client_id] = epoch
         print(f"  🚩 [SafeSplit] Client {client_id} flagged "
               f"for epoch {epoch} (will retry next epoch)")
     
     def unflag_client(self, client_id: int):
-        """Previous flag clear করো।"""
         if client_id in self._flagged_clients:
             del self._flagged_clients[client_id]
     
     def is_flagged(self, client_id: int, epoch: int) -> bool:
-        """Client এই epoch-এ flagged কিনা।"""
         return (client_id in self._flagged_clients and 
                 self._flagged_clients[client_id] == epoch)
 
-
-# ─────────────────────────────────────────────────────────────
-# Main SafeSplit Defense
-# ─────────────────────────────────────────────────────────────
 
 class SafeSplitDefense:
     
@@ -304,7 +280,6 @@ class SafeSplitDefense:
         self.device = device
         self.combined_threshold = combined_threshold
         
-        # Three components
         self.freq_analyzer = FrequencyAnalyzer(
             low_freq_ratio=freq_low_ratio,
             anomaly_threshold=freq_threshold
@@ -318,7 +293,6 @@ class SafeSplitDefense:
             max_checkpoints=max_checkpoints
         )
         
-        # Statistics
         self._total_clients = 0
         self._flagged_count = 0
         self._rollback_count = 0
@@ -337,10 +311,8 @@ class SafeSplitDefense:
                                 client_id: int,
                                 server_model: nn.Module):
       
-        # Save checkpoint for rollback
         self.rollback.save_checkpoint(epoch, client_id, server_model)
         
-        # Save checkpoint for analysis
         self.freq_analyzer.save_checkpoint(server_model)
         self.rot_analyzer.save_checkpoint(server_model)
     
@@ -351,25 +323,19 @@ class SafeSplitDefense:
         
         self._total_clients += 1
         
-        # Static Analysis: DCT frequency
         freq_result = self.freq_analyzer.analyze(server_model)
         
-        # Dynamic Analysis: Rotational distance
         rot_result = self.rot_analyzer.analyze(server_model)
         
-        # Combined decision
-        # Both analyses must agree (AND logic for lower false positive)
         freq_anomalous = freq_result['is_anomalous']
         rot_anomalous = rot_result['is_anomalous']
         
-        # Combined score (average of z-scores)
         combined_score = (freq_result['anomaly_score'] + 
                          rot_result['anomaly_score']) / 2
         
         is_poisoned = (freq_anomalous and rot_anomalous) or \
                       (combined_score > self.combined_threshold * 2)
         
-        # Record detection
         detection = {
             'epoch': epoch,
             'client_id': client_id,
@@ -392,18 +358,15 @@ class SafeSplitDefense:
             print(f"     Rot score    : {rot_result['anomaly_score']:.2f}")
             print(f"     Combined     : {combined_score:.2f}")
             
-            # Rollback server model
             rolled_back = self.rollback.rollback(
                 server_model, epoch, client_id)
             
             if rolled_back:
                 self._rollback_count += 1
             
-            # Flag client (skip this epoch, retry next)
             self.rollback.flag_client(client_id, epoch)
             
         else:
-            # Unflag if previously flagged
             self.rollback.unflag_client(client_id)
             
             if len(self._detection_history) % 10 == 0:
@@ -421,7 +384,6 @@ class SafeSplitDefense:
         return self.rollback.is_flagged(client_id, epoch - 1)
     
     def get_stats(self) -> dict:
-        """Defense statistics।"""
         detection_rate = (self._flagged_count / 
                          max(1, self._total_clients) * 100)
         return {
@@ -442,10 +404,6 @@ class SafeSplitDefense:
         print(f"  Checkpoints      : {stats['checkpoints_stored']}\n")
 
 
-# ─────────────────────────────────────────────────────────────
-# Quick Test
-# ─────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     print("=" * 55)
     print("  SafeSplit Defense — Quick Test")
@@ -454,7 +412,6 @@ if __name__ == "__main__":
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}\n")
     
-    # Simple server model (PyramidCNN server side)
     server_model = nn.Sequential(
         nn.Conv2d(64, 128, 3, padding=1),
         nn.BatchNorm2d(128),
@@ -470,7 +427,6 @@ if __name__ == "__main__":
     optimizer = torch.optim.SGD(
         server_model.parameters(), lr=0.01)
     
-    # Initialize SafeSplit
     defense = SafeSplitDefense(
         server_model=server_model,
         freq_threshold=2.0,
@@ -481,23 +437,20 @@ if __name__ == "__main__":
     print("--- Simulating Multi-Client Training ---\n")
     
     n_epochs = 3
-    n_clients = 4  # Client 0,1,2 = benign, Client 3 = malicious
+    n_clients = 4  
     
     for epoch in range(1, n_epochs + 1):
         print(f"Epoch {epoch}:")
         
         for client_id in range(n_clients):
-            # Skip if flagged from previous epoch
             if defense.should_skip_client(client_id, epoch):
                 print(f"  ⏭️  Skipping client {client_id} "
                       f"(flagged prev epoch)")
                 continue
             
-            # BEFORE training
             defense.before_client_training(
                 epoch, client_id, server_model)
             
-            # Simulate training
             fake_smashed = torch.randn(16, 64, 16, 16).to(device)
             fake_labels = torch.randint(0, 10, (16,)).to(device)
             
@@ -505,12 +458,9 @@ if __name__ == "__main__":
             output = server_model(fake_smashed)
             loss = nn.CrossEntropyLoss()(output, fake_labels)
             
-            # Malicious client 3 injects backdoor
-            # (makes large parameter updates)
             if client_id == 3 and epoch >= 2:
-                backdoor_loss = loss * 8.0  # Simulate aggressive update
+                backdoor_loss = loss * 8.0  
                 backdoor_loss.backward()
-                # Extra perturbation to simulate backdoor
                 with torch.no_grad():
                     for param in server_model.parameters():
                         param.data += torch.randn_like(param) * 0.5
@@ -519,7 +469,6 @@ if __name__ == "__main__":
             
             optimizer.step()
             
-            # AFTER training
             is_poisoned = defense.after_client_training(
                 epoch, client_id, server_model)
             
@@ -532,7 +481,6 @@ if __name__ == "__main__":
     
     print("\n--- Testing All Cut Layers ---")
     
-    # PyramidCNN cut layer 1, 2, 3 server models
     for cl, in_ch, name in [
         (1, 32, "Weak Device"),
         (2, 64, "Medium Device"),
@@ -547,7 +495,6 @@ if __name__ == "__main__":
         
         d = SafeSplitDefense(srv, device=str(device))
         
-        # One round test
         d.before_client_training(1, 0, srv)
         opt = torch.optim.SGD(srv.parameters(), lr=0.01)
         

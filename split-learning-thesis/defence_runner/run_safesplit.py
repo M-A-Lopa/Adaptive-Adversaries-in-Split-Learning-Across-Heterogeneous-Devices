@@ -1,16 +1,45 @@
+"""
+safesplit_run.py -- SafeSplit vs ALL 8 attacks, same structure as zorro_run.py.
 
+Place in:  defence_runner/safesplit_run.py
+Run from the repo root:
+    python -m defence_runner.safesplit_run --model PyramidCNN
+    python -m defence_runner.safesplit_run --model KAGN
+Useful options:
+    --attacks VILLAIN,BackdoorPoison_Client      run only these attacks
+    --variant pmr20 --pmr 0.2                    20% of turns malicious, rest benign clients
+    --variant strict --freq-threshold 2.0 --rot-threshold 1.5
+    --server-only-rollback                       old behaviour (client keeps its poisoned part)
+
+How SafeSplit is used here (existing_defense/safesplit_defense.py; Rieger et al., NDSS 2025)
+------------------------------------------------------------------------------------------
+SafeSplit is a SERVER-side defense. Around every client "turn" the server saves its model,
+then scores how far the server model moved (DCT frequency distance and rotation angle,
+z-scored against recent benign history). If both look anomalous (or the combined score is
+very high) the turn is flagged and the server is rolled back to the pre-turn checkpoint.
+
+Same wiring pattern as zorro_run.py
+  * Training: one epoch = one turn of a benign client, SafeSplit in the loop.
+  * Attacks 1-5 (WhiteBox, UnSplit, AE, FSHA, LabelLeakage): no hook; run on the SafeSplit-trained model.
+  * VILLAIN and Backdoor(Client): the attacker's training is driven one turn (epoch) at a time.
+    Before the malicious turns, `--seed-turns` BENIGN turns run through SafeSplit so its z-score
+    history is real. `--pmr` < 1 interleaves benign-client turns with the malicious ones.
+  * Backdoor(Server): the attacker IS the server that runs SafeSplit -> runs unmonitored.
+On a flag the WHOLE model is rolled back (server by SafeSplit, client from a snapshot taken before
+the turn), like Zorro's benchmark-model reload. The attacker's NEXT turn after a flag is skipped
+(SafeSplit's "flag client, retry next epoch"), tracked per client id.
+Per-turn logs go to results/safesplit_turns_<attack>_<tag>_<variant>.csv.
+Stats: PDR = % malicious turns flagged, FPR = % benign turns flagged (seed turns excluded).
+"""
 import os
 import sys
 import time
 import random
 import argparse
 import traceback
-from copy import deepcopy
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-# SafeSplitDefense prints emoji; legacy Windows code pages would raise UnicodeEncodeError.
-for _s in (sys.stdout, sys.stderr):
+for _s in (sys.stdout, sys.stderr):          # SafeSplit prints emoji; legacy Windows code pages would crash
     try:
         _s.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
@@ -29,7 +58,7 @@ from config import Config
 from dataset import DatasetLoader
 from all_attacks.attack_unsplit import UnSplitAttack
 from all_attacks.attacks_whitebox import WhiteBoxInversionAttack, AttackMetricsTracker
-from all_attacks.ae_decoder_attack import run_ae_decoder_attack, save_ae_attack_visualization
+from all_attacks.ae_decoder_attack import run_ae_decoder_attack
 from all_attacks.fsha_attack import FSHAAttack
 from all_attacks.label_leakage_attack import GradientNormLabelLeakageAttack, build_binary_split_loaders
 from all_attacks.villain_backdoor_attack import VILLAINBackdoorAttack, build_indexed_loader
@@ -41,43 +70,28 @@ from existing_defense.safesplit_defense import SafeSplitDefense
 
 BLANK = "—"
 DEFENSE_NAME = "safesplit"
-CLIENT_ID = 0            # single-client setting
-
-# ── SafeSplit hyper-parameters = the defaults of SafeSplitDefense ───────────
-SS_FREQ_LOW_RATIO     = 0.1
-SS_FREQ_THRESHOLD     = 2.5
-SS_ROT_THRESHOLD      = 2.0
-SS_COMBINED_THRESHOLD = 1.5
-SS_MAX_CHECKPOINTS    = 10
-
 EXPECTED_ATTACKS = ['WhiteBox', 'UnSplit', 'AE_Decoder', 'FSHA', 'LabelLeakage',
                     'VILLAIN', 'BackdoorPoison_Client', 'BackdoorPoison_Server']
-
-# Was SafeSplit actually in the loop for this attack?
-DEFENSE_ACTIVE = {'WhiteBox': 'no (no hook)', 'UnSplit': 'no (no hook)', 'AE_Decoder': 'no (no hook)',
-                  'FSHA': 'no (no hook)', 'LabelLeakage': 'no (no hook)',
-                  'VILLAIN': 'yes (injection phase)', 'BackdoorPoison_Client': 'yes',
-                  'BackdoorPoison_Server': 'no (attacker is the server)'}
+DEFENSE_ACTIVE = {'WhiteBox': 'no (no hook: SafeSplit does not alter smashed data)',
+                  'UnSplit': 'no (no hook)', 'AE_Decoder': 'no (no hook)', 'FSHA': 'no (no hook)',
+                  'LabelLeakage': 'no (no hook)',
+                  'VILLAIN': 'yes (injection phase, one turn per epoch)',
+                  'BackdoorPoison_Client': 'yes (one turn per epoch)',
+                  'BackdoorPoison_Server': 'no (attacker is the server; outside SafeSplit threat model)'}
 
 
 def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
 
 def load_checked(module, state, what):
-    """strict=False silently leaves layers untrained on a mismatch -> fail loudly instead."""
     missing, unexpected = module.load_state_dict(state, strict=False)
-    assert not missing, f"[{what}] checkpoint is missing keys (untrained layers): {list(missing)[:5]}"
+    assert not missing, f"[{what}] checkpoint is missing keys: {list(missing)[:5]}"
     assert not unexpected, f"[{what}] checkpoint has unexpected keys: {list(unexpected)[:5]}"
 
 
 def materialize_lazy(client, server, device, in_channels=3, image_size=32):
-    """The server contains nn.LazyLinear, uninitialised until its first forward pass.
-    SafeSplit clones/deep-copies the server weights BEFORE the first epoch, which fails on
-    uninitialised parameters, so run one dry forward pass (eval mode: no BN/dropout side effects)."""
+    """The server has nn.LazyLinear; SafeSplit clones weights before epoch 1, so initialise it first."""
     was = (client.training, server.training)
     client.eval(); server.eval()
     with torch.no_grad():
@@ -85,111 +99,146 @@ def materialize_lazy(client, server, device, in_channels=3, image_size=32):
     client.train(was[0]); server.train(was[1])
 
 
+def cpu_state(module):
+    return {k: v.detach().cpu().clone() for k, v in module.state_dict().items()}
+
+
+def cfg_of(args):
+    return {'freq_low_ratio': args.freq_low_ratio, 'freq_threshold': args.freq_threshold,
+            'rot_threshold': args.rot_threshold, 'combined_threshold': args.combined_threshold,
+            'max_checkpoints': args.max_checkpoints, 'seed_turns': args.seed_turns,
+            'rollback_client': not args.server_only_rollback}
+
+
+def make_defense(args, server_model, device):
+    return SafeSplitDefense(server_model=server_model, freq_low_ratio=args.freq_low_ratio,
+                            freq_threshold=args.freq_threshold, rot_threshold=args.rot_threshold,
+                            combined_threshold=args.combined_threshold, max_checkpoints=args.max_checkpoints,
+                            device=str(device))
+
+
 # ═════════════════════════════════════════════════════════════════════════════
-#  SafeSplit helpers
+#  SafeSplit guard: one place that runs a turn, logs it, rolls back, and counts
 # ═════════════════════════════════════════════════════════════════════════════
-def make_defense(server_model, device, benign_hist=None):
-    """Fresh SafeSplitDefense; optionally seeded with the benign z-score history
-    recorded during clean training (so a malicious turn is judged against a benign past)."""
-    d = SafeSplitDefense(server_model=server_model,
-                         freq_low_ratio=SS_FREQ_LOW_RATIO,
-                         freq_threshold=SS_FREQ_THRESHOLD,
-                         rot_threshold=SS_ROT_THRESHOLD,
-                         combined_threshold=SS_COMBINED_THRESHOLD,
-                         max_checkpoints=SS_MAX_CHECKPOINTS,
-                         device=str(device))
-    if benign_hist:
-        d.freq_analyzer._distance_history = [float(v) for v in benign_hist.get('freq', [])]
-        d.rot_analyzer._rotation_history = [float(v) for v in benign_hist.get('rot', [])]
-    return d
+class SafeSplitGuard:
+    def __init__(self, args, server_model, device):
+        self.args = args
+        self.d = make_defense(args, server_model, device)
+        self.log = []
+        self.skipped = 0
+        self.prev_flagged = {}            # client id -> was flagged on its previous turn
 
+    def _scores(self):
+        h = getattr(self.d, '_detection_history', None)
+        if h and isinstance(h[-1], dict):
+            r = h[-1]
+            return (float(r.get('freq_anomaly_score', float('nan'))), float(r.get('rot_anomaly_score', float('nan'))),
+                    float(r.get('combined_score', float('nan'))))
+        return float('nan'), float('nan'), float('nan')
 
-def export_hist(defense):
-    return {'freq': [float(v) for v in defense.freq_analyzer._distance_history],
-            'rot': [float(v) for v in defense.rot_analyzer._rotation_history]}
+    def should_skip(self, cid):
+        return bool(self.prev_flagged.get(cid, False))
 
-
-def guarded_epochs(atk, defense, n_epochs, run_epoch, test_loader, label):
-    """
-    Drive an attack's training ONE EPOCH AT A TIME with SafeSplit around each epoch.
-    `atk` must expose .server_model, .history {'epoch','asr','cda'} and .evaluate(test_loader)
-    -> (clean_acc, asr). `run_epoch()` must train exactly one epoch and append one history entry.
-    """
-    stats = {'accepted': 0, 'rolled_back': 0, 'skipped': 0, 'flagged_epochs': []}
-    for e in range(1, n_epochs + 1):
-        if defense.should_skip_client(CLIENT_ID, e):
-            stats['skipped'] += 1
-            cda, asr = atk.evaluate(test_loader)
-            atk.history['epoch'].append(e)
-            atk.history['asr'].append(asr)
-            atk.history['cda'].append(cda)
-            print(f"  [SafeSplit] {label} turn {e:2d}/{n_epochs}: SKIPPED (flagged last turn) | "
-                  f"ASR {asr:.2f}% | CDA {cda:.2f}%")
-            continue
-
-        defense.before_client_training(e, CLIENT_ID, atk.server_model)
+    def turn(self, turn, cid, client, server, run_epoch, poisoned, phase='run'):
+        snap = cpu_state(client)
+        self.d.before_client_training(turn, cid, server)
         run_epoch()
-        flagged = defense.after_client_training(e, CLIENT_ID, atk.server_model)
+        flagged = bool(self.d.after_client_training(turn, cid, server))     # SafeSplit rolls the server back itself
+        if flagged and not self.args.server_only_rollback:
+            client.load_state_dict(snap)                                    # discard the whole turn
+        f, r, cmb = self._scores()
+        rec = {'turn': turn, 'client': cid, 'phase': phase, 'poisoned': poisoned, 'flagged': flagged,
+               'skipped': False, 'freq_score': f, 'rot_score': r, 'combined': cmb}
+        self.log.append(rec)
+        self.prev_flagged[cid] = flagged
+        return rec
 
-        if flagged:
-            stats['rolled_back'] += 1
-            stats['flagged_epochs'].append(e)
-            # the attack logged ASR/CDA of the poisoned model; replace with post-rollback values
-            cda, asr = atk.evaluate(test_loader)
-            atk.history['asr'][-1] = asr
-            atk.history['cda'][-1] = cda
-            print(f"  [SafeSplit] {label} turn {e:2d}/{n_epochs}: FLAGGED -> server rolled back | "
-                  f"ASR {asr:.2f}% | CDA {cda:.2f}%")
+    def skip(self, turn, cid, poisoned):
+        self.skipped += 1
+        self.prev_flagged[cid] = False
+        self.log.append({'turn': turn, 'client': cid, 'phase': 'run', 'poisoned': poisoned, 'flagged': False,
+                         'skipped': True, 'freq_score': float('nan'), 'rot_score': float('nan'),
+                         'combined': float('nan')})
+
+    def summary(self):
+        run = [r for r in self.log if r['phase'] == 'run' and not r['skipped']]
+        mal = [r for r in run if r['poisoned']]; ben = [r for r in run if not r['poisoned']]
+        mf = sum(r['flagged'] for r in mal); bf = sum(r['flagged'] for r in ben)
+        first = next((r['turn'] for r in mal if r['flagged']), None)
+        return {'malicious_turns': len(mal), 'benign_turns': len(ben), 'malicious_flagged': mf,
+                'benign_flagged': bf, 'PDR': 100.0 * mf / max(1, len(mal)), 'FPR': 100.0 * bf / max(1, len(ben)),
+                'rollbacks': mf + bf, 'skipped': self.skipped, 'first_detection_turn': first}
+
+
+def seed_history(guard, atk, benign_epoch, n):
+    """Real benign turns through SafeSplit so its z-score history is not empty when the attacker starts."""
+    for i in range(1, n + 1):
+        guard.turn(i, f'seed_{i}', atk.client_model, atk.server_model, benign_epoch, poisoned=False, phase='seed')
+    print(f"  [SafeSplit] seeded with {n} benign turns "
+          f"(flagged during seeding: {sum(r['flagged'] for r in guard.log if r['phase']=='seed')})")
+
+
+def make_schedule(n_malicious, pmr, seed):
+    if pmr >= 1.0:
+        return ['M'] * n_malicious
+    total = int(round(n_malicious / pmr))
+    rng = random.Random(seed)
+    pos = set(rng.sample(range(total), n_malicious))
+    return ['M' if i in pos else 'B' for i in range(total)]
+
+
+def guarded_turns(atk, guard, schedule, malicious_epoch, benign_epoch, test_loader, label, turn0):
+    hist = {'epoch': [], 'asr': [], 'cda': []}
+    for i, kind in enumerate(schedule, 1):
+        t = turn0 + i
+        cid = 'attacker' if kind == 'M' else f'benign_{i}'
+        if kind == 'M' and guard.should_skip(cid):
+            guard.skip(t, cid, True)
+            msg = "SKIPPED (attacker flagged on its previous turn)"
         else:
-            stats['accepted'] += 1
-            print(f"  [SafeSplit] {label} turn {e:2d}/{n_epochs}: accepted | "
-                  f"ASR {atk.history['asr'][-1]:.2f}% | CDA {atk.history['cda'][-1]:.2f}%")
-
-    atk.history['epoch'] = list(range(1, len(atk.history['asr']) + 1))
-    return stats
+            rec = guard.turn(t, cid, atk.client_model, atk.server_model,
+                             malicious_epoch if kind == 'M' else benign_epoch, poisoned=(kind == 'M'))
+            msg = ("FLAGGED -> rolled back" if rec['flagged'] else "accepted") + \
+                  f" | freq {rec['freq_score']:.2f} rot {rec['rot_score']:.2f}"
+        cda, asr = atk.evaluate(test_loader)
+        hist['epoch'].append(i); hist['asr'].append(asr); hist['cda'].append(cda)
+        print(f"  [SafeSplit] {label} turn {i:2d}/{len(schedule)} ({kind}) {msg} | ASR {asr:.2f}% | CDA {cda:.2f}%")
+    atk.history = hist
+    return guard.summary()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  SafeSplit-monitored split-learning trainer (benign client)
+#  SafeSplit-monitored split-learning trainer (benign client, one epoch = one turn)
 # ═════════════════════════════════════════════════════════════════════════════
 class SafeSplitTrainer:
-    def __init__(self, client, server, train_loader, test_loader, device, ckpt_path):
-        self.client, self.server = client, server
-        self.train_loader, self.test_loader = train_loader, test_loader
-        self.device, self.ckpt_path = device, ckpt_path
+    CLIENT_ID = 0
 
+    def __init__(self, client, server, train_loader, test_loader, device, ckpt_path, args):
+        self.client, self.server, self.device, self.ckpt_path = client, server, device, ckpt_path
+        self.train_loader, self.test_loader = train_loader, test_loader
+        self.args = args
         self.client_opt = torch.optim.Adam(client.parameters(), lr=Config.LEARNING_RATE)
         self.server_opt = torch.optim.Adam(server.parameters(), lr=Config.LEARNING_RATE)
         self.client_sched = torch.optim.lr_scheduler.ReduceLROnPlateau(self.client_opt, patience=5, factor=0.5)
         self.server_sched = torch.optim.lr_scheduler.ReduceLROnPlateau(self.server_opt, patience=5, factor=0.5)
         self.criterion = nn.CrossEntropyLoss()
-        self.defense = make_defense(server, device)
+        self.defense = make_defense(args, server, device)
+        self.losses, self.train_accs, self.test_accs, self.skipped = [], [], [], 0
 
-        self.losses, self.train_accs, self.test_accs = [], [], []
-        self.skipped = 0
-
-    def _train_one_epoch(self, epoch_idx):
+    def _epoch(self):
         self.client.train(); self.server.train()
         run_loss, correct, total = 0.0, 0, 0
-        bar = tqdm(self.train_loader, desc=f"  SafeSplit Epoch [{epoch_idx+1}/{Config.EPOCHS}]", leave=False)
-        for x, y in bar:
+        for x, y in tqdm(self.train_loader, desc="  SafeSplit benign turn", leave=False):
             x, y = x.to(self.device), y.to(self.device)
             self.client_opt.zero_grad()
             z = self.client(x)
             z_leaf = z.detach().requires_grad_(True)
-
             self.server_opt.zero_grad()
             out = self.server(z_leaf)
             loss = self.criterion(out, y)
-            loss.backward()
-            self.server_opt.step()
-
-            z.backward(z_leaf.grad)
-            self.client_opt.step()
-
-            run_loss += loss.item(); total += y.size(0)
-            correct += out.argmax(1).eq(y).sum().item()
-            bar.set_postfix(Loss=f"{loss.item():.4f}", Acc=f"{100.*correct/total:.2f}%")
+            loss.backward(); self.server_opt.step()
+            z.backward(z_leaf.grad); self.client_opt.step()
+            run_loss += loss.item(); total += y.size(0); correct += out.argmax(1).eq(y).sum().item()
         return run_loss / len(self.train_loader), 100.0 * correct / total
 
     @torch.no_grad()
@@ -202,24 +251,19 @@ class SafeSplitTrainer:
         return 100.0 * c / t
 
     def train(self):
-        print("\n" + "=" * 60)
-        print(f"   SAFESPLIT SPLIT LEARNING — {Config.MODEL_NAME} | cut {Config.CUT_LAYER}")
-        print("=" * 60)
+        print("\n" + "=" * 60 + f"\n   SAFESPLIT SPLIT LEARNING — {Config.MODEL_NAME} | cut {Config.CUT_LAYER}\n" + "=" * 60)
         best = 0.0
-        for epoch in range(1, Config.EPOCHS + 1):          # turn ids are 1-based
-            if self.defense.should_skip_client(CLIENT_ID, epoch):
+        for epoch in range(1, Config.EPOCHS + 1):
+            if self.defense.should_skip_client(self.CLIENT_ID, epoch):
                 self.skipped += 1
                 print(f"  Epoch {epoch:3d}/{Config.EPOCHS} | SKIPPED (client flagged last turn)")
                 continue
-
-            client_snapshot = deepcopy(self.client.state_dict())
-            self.defense.before_client_training(epoch, CLIENT_ID, self.server)
-            loss, tr = self._train_one_epoch(epoch - 1)
-            flagged = self.defense.after_client_training(epoch, CLIENT_ID, self.server)
+            snap = cpu_state(self.client)
+            self.defense.before_client_training(epoch, self.CLIENT_ID, self.server)
+            loss, tr = self._epoch()
+            flagged = bool(self.defense.after_client_training(epoch, self.CLIENT_ID, self.server))
             if flagged:
-                # SafeSplit restored the server; discard the client's part of the turn too
-                self.client.load_state_dict(client_snapshot)
-
+                self.client.load_state_dict(snap)
             te = self.evaluate()
             self.losses.append(loss); self.train_accs.append(tr); self.test_accs.append(te)
             self.client_sched.step(te); self.server_sched.step(te)
@@ -227,66 +271,47 @@ class SafeSplitTrainer:
             print(f"  Epoch {epoch:3d}/{Config.EPOCHS} | Loss {loss:.4f} | Train {tr:.2f}% | Test {te:.2f}% | "
                   f"SafeSplit flagged {st['flagged_as_poisoned']}/{st['total_clients_analyzed']}"
                   f"{' (rolled back)' if flagged else ''}")
-
             if te > best:
                 best = te
-                torch.save({'epoch': epoch,
-                            'client_state': self.client.state_dict(),
-                            'server_state': self.server.state_dict(),
-                            'best_acc': best,
-                            'dataset': Config.DATASET,
-                            'model_type': Config.MODEL_NAME,
-                            'cut_layer': Config.CUT_LAYER,
-                            'defense': DEFENSE_NAME,
-                            'safesplit_hist': export_hist(self.defense)}, self.ckpt_path)
+                torch.save({'epoch': epoch, 'client_state': self.client.state_dict(),
+                            'server_state': self.server.state_dict(), 'best_acc': best,
+                            'dataset': Config.DATASET, 'model_type': Config.MODEL_NAME,
+                            'cut_layer': Config.CUT_LAYER, 'defense': DEFENSE_NAME,
+                            'safesplit_cfg': cfg_of(self.args)}, self.ckpt_path)
         self.defense.print_stats()
-        print(f"  SafeSplit training complete. Best test accuracy: {best:.2f}% | skipped turns: {self.skipped}")
+        print(f"  SafeSplit benign training done. Best test accuracy {best:.2f}% | skipped turns {self.skipped}")
         return self.losses, self.train_accs, self.test_accs
 
-    def stats(self):
-        s = dict(self.defense.get_stats())
-        s['skipped_turns'] = self.skipped
-        s.update({'freq_low_ratio': SS_FREQ_LOW_RATIO, 'freq_threshold': SS_FREQ_THRESHOLD,
-                  'rot_threshold': SS_ROT_THRESHOLD, 'combined_threshold': SS_COMBINED_THRESHOLD,
-                  'max_checkpoints': SS_MAX_CHECKPOINTS})
-        return s
 
-
-def plot_training(losses, tr, te, tag):
-    ep = range(1, len(losses) + 1)
-    fig, (a1, a2) = plt.subplots(1, 2, figsize=(13, 5))
-    a1.plot(ep, losses, 'b-', lw=2); a1.set_title('Training Loss'); a1.grid(alpha=.3)
-    a2.plot(ep, tr, 'b-', lw=2, label='Train'); a2.plot(ep, te, 'r-', lw=2, label='Test')
-    a2.set_title('Accuracy (%)'); a2.legend(); a2.grid(alpha=.3)
-    plt.suptitle(f'SafeSplit {Config.MODEL_NAME} Split Learning — {Config.DATASET} (cut {Config.CUT_LAYER})')
-    plt.tight_layout()
-    path = f"{Config.RESULTS_DIR}/{DEFENSE_NAME}_training_curves_{tag}.png"
-    plt.savefig(path, dpi=150, bbox_inches='tight'); plt.close(fig)
-    print(f"  Training curves saved → {path}")
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  Main
-# ═════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument('--model', default=Config.MODEL_NAME, choices=['KAGN', 'PyramidCNN', 'Vanilla_SL'])
-    ap.add_argument('--cut', type=int, default=2, help="cut layer (KAGN / PyramidCNN); task requires 2")
+    ap.add_argument('--cut', type=int, default=2)
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--skip-attacks', action='store_true')
+    ap.add_argument('--attacks', default=','.join(EXPECTED_ATTACKS),
+                    help="comma-separated subset of: " + ','.join(EXPECTED_ATTACKS))
+    ap.add_argument('--variant', default='full', help="name used in output files (ablation id)")
+    ap.add_argument('--freq-low-ratio', type=float, default=0.1)
+    ap.add_argument('--freq-threshold', type=float, default=2.5)
+    ap.add_argument('--rot-threshold', type=float, default=2.0)
+    ap.add_argument('--combined-threshold', type=float, default=1.5)
+    ap.add_argument('--max-checkpoints', type=int, default=10)
+    ap.add_argument('--seed-turns', type=int, default=5, help="benign turns run through SafeSplit before the attacker starts")
+    ap.add_argument('--server-only-rollback', action='store_true',
+                    help="on a flag roll back only the server (attacker keeps its client part)")
+    ap.add_argument('--pmr', type=float, default=1.0, help="fraction of turns that are malicious")
     args = ap.parse_args()
 
-    Config.MODEL_NAME = args.model
-    Config.CUT_LAYER = args.cut
-    Config.DATASET = 'CIFAR10'
+    Config.MODEL_NAME, Config.CUT_LAYER, Config.DATASET = args.model, args.cut, 'CIFAR10'
     set_seed(args.seed)
-
     device = torch.device(Config.DEVICE if torch.cuda.is_available() else 'cpu')
     TAG = f"{Config.MODEL_NAME.lower()}_cut{Config.CUT_LAYER}_{Config.DATASET}"
-    os.makedirs(Config.SAVE_DIR, exist_ok=True)
-    os.makedirs(Config.RESULTS_DIR, exist_ok=True)
-    print(f"Device: {device} | Defense: SAFESPLIT | Model: {Config.MODEL_NAME} | "
-          f"Cut layer: {Config.CUT_LAYER} | Dataset: {Config.DATASET} | Seed: {args.seed}")
+    VTAG = f"{TAG}_{args.variant}"
+    os.makedirs(Config.SAVE_DIR, exist_ok=True); os.makedirs(Config.RESULTS_DIR, exist_ok=True)
+    selected = [a.strip() for a in args.attacks.split(',') if a.strip()]
+    assert set(selected) <= set(EXPECTED_ATTACKS), f"unknown attack(s): {set(selected) - set(EXPECTED_ATTACKS)}"
+    print(f"Device: {device} | Defense: SAFESPLIT ({args.variant}) | {cfg_of(args)} | pmr {args.pmr}")
 
     train_loader, test_loader = DatasetLoader(dataset_name=Config.DATASET).get_loaders()
     in_channels = 3
@@ -310,53 +335,44 @@ if __name__ == "__main__":
 
     def _load_ckpt():
         ck = torch.load(checkpoint_path, map_location=device)
-        if 'cut_layer' in ck and Config.MODEL_NAME != "Vanilla_SL":
-            assert ck['cut_layer'] == Config.CUT_LAYER, \
-                f"Checkpoint cut layer {ck['cut_layer']} != requested {Config.CUT_LAYER}"
-        assert ck.get('defense', DEFENSE_NAME) == DEFENSE_NAME, "Checkpoint is not a SafeSplit checkpoint"
+        assert ck.get('defense') == DEFENSE_NAME, "Checkpoint is not a SafeSplit checkpoint"
+        if Config.MODEL_NAME != "Vanilla_SL":
+            assert ck['cut_layer'] == Config.CUT_LAYER
         return ck
 
-    def build_fresh_client():
-        """Untrained client (attacker-side clone for UnSplit / FSHA / server-backdoor surrogate)."""
-        return build_client()
-
     def build_fresh_split(num_classes):
-        """Client initialised from the SafeSplit-trained checkpoint; server only if 10-class."""
         c, s = build_client(), build_server(num_classes)
         ck = _load_ckpt()
         load_checked(c, ck['client_state'], 'safesplit client')
         if num_classes == Config.NUM_CLASSES:
             load_checked(s, ck['server_state'], 'safesplit server')
+        else:
+            materialize_lazy(c, s, device, in_channels)
         return c, s
 
     client_model, server_model = build_client(), build_server(Config.NUM_CLASSES)
     materialize_lazy(client_model, server_model, device, in_channels)
 
-    train_stats = None
     if os.path.exists(checkpoint_path):
         print(f"\n[✓] Found SafeSplit checkpoint: {checkpoint_path} — skipping training")
     else:
-        print(f"\n[!] No checkpoint at {checkpoint_path} — training with SafeSplit")
-        trainer = SafeSplitTrainer(client_model, server_model, train_loader, test_loader, device, checkpoint_path)
+        print(f"\n[!] No checkpoint at {checkpoint_path} — training with SafeSplit (default settings)")
+        default_args = ap.parse_args([])
+        trainer = SafeSplitTrainer(client_model, server_model, train_loader, test_loader, device,
+                                   checkpoint_path, default_args)
         losses, tr_accs, te_accs = trainer.train()
-        plot_training(losses, tr_accs, te_accs, TAG)
-        pd.DataFrame({'epoch': range(1, len(losses) + 1), 'train_loss': losses,
-                      'train_accuracy': tr_accs, 'test_accuracy': te_accs}
-                     ).to_csv(f"{Config.RESULTS_DIR}/{DEFENSE_NAME}_results_{TAG}.csv", index=False)
-        train_stats = trainer.stats()
-        pd.DataFrame([train_stats]).to_csv(f"{Config.RESULTS_DIR}/{DEFENSE_NAME}_stats_{TAG}.csv", index=False)
+        pd.DataFrame({'epoch': range(1, len(losses) + 1), 'train_loss': losses, 'train_accuracy': tr_accs,
+                      'test_accuracy': te_accs}).to_csv(f"{Config.RESULTS_DIR}/{DEFENSE_NAME}_results_{TAG}.csv",
+                                                        index=False)
+        pd.DataFrame([{**trainer.defense.get_stats(), 'skipped_turns': trainer.skipped,
+                       **{f'cfg_{k}': v for k, v in cfg_of(default_args).items()}}]).to_csv(
+            f"{Config.RESULTS_DIR}/{DEFENSE_NAME}_stats_{TAG}.csv", index=False)
         pd.DataFrame(trainer.defense._detection_history).to_csv(
-            f"{Config.RESULTS_DIR}/{DEFENSE_NAME}_detections_train_{TAG}.csv", index=False)
+            f"{Config.RESULTS_DIR}/{DEFENSE_NAME}_turns_train_{TAG}.csv", index=False)
 
-    # always evaluate/attack the BEST checkpoint (the one saved by the trainer)
     ck = _load_ckpt()
     load_checked(client_model, ck['client_state'], 'safesplit client')
     load_checked(server_model, ck['server_state'], 'safesplit server')
-    benign_hist = ck.get('safesplit_hist')
-    if not benign_hist:
-        print("  [warn] checkpoint has no SafeSplit benign history; attack-phase z-scores start cold")
-
-    # ── Clean accuracy of the exact model the attacks will target ─────────
     client_model.eval(); server_model.eval()
     c = t = 0
     with torch.no_grad():
@@ -365,16 +381,10 @@ if __name__ == "__main__":
             c += server_model(client_model(x)).argmax(1).eq(y).sum().item(); t += y.size(0)
     clean_acc = 100.0 * c / t
     print(f"\n  Clean test accuracy (SafeSplit, {Config.MODEL_NAME}, cut {Config.CUT_LAYER}): {clean_acc:.2f}%")
-    pd.DataFrame([{'defense': DEFENSE_NAME, 'model': Config.MODEL_NAME, 'cut_layer': Config.CUT_LAYER,
-                   'dataset': Config.DATASET, 'checkpoint': checkpoint_path, 'clean_acc': clean_acc}]
-                 ).to_csv(f"{Config.RESULTS_DIR}/{DEFENSE_NAME}_clean_acc_{TAG}.csv", index=False)
-
     if args.skip_attacks:
         sys.exit(0)
 
-    # ═════════════════════════════════════════════════════════════════════
-    #  ATTACKS (same parameters as unified_defense_run.py / zorro_run.py)
-    # ═════════════════════════════════════════════════════════════════════
+    # ── attack parameters: identical to zorro_run.py ──────────────────────
     MAX_IMAGES, ITERATIONS = 32, 1000
     HIJACK_EPOCHS, CRITIC_ITERS = 5, 5
     LEAKAGE_EPOCHS, POSITIVE_CLASS, POSITIVE_RATIO, LEAKAGE_BATCH, LEAKAGE_LR = 5, 0, 0.1, 128, 1e-4
@@ -385,12 +395,13 @@ if __name__ == "__main__":
 
     mean = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1).to(device)
     std = torch.tensor([0.2023, 0.1994, 0.2010]).view(1, 3, 1, 1).to(device)
-
     results, failures, activity = {}, {}, {}
     R = Config.RESULTS_DIR
 
     def run_attack(name, title, fn):
-        print("\n" + "=" * 60 + f"\n  {title} vs SAFESPLIT — {Config.MODEL_NAME} (cut {Config.CUT_LAYER})\n" + "=" * 60)
+        if name not in selected:
+            return
+        print("\n" + "=" * 60 + f"\n  {title} vs SAFESPLIT[{args.variant}] — {Config.MODEL_NAME} (cut {Config.CUT_LAYER})\n" + "=" * 60)
         t0 = time.time()
         try:
             results[name] = fn()
@@ -400,16 +411,16 @@ if __name__ == "__main__":
             print(f"  [FAILED] {failures[name]}")
             traceback.print_exc()
 
-    def record_activity(name, defense, stats):
+    def record_activity(name, guard, stats):
         activity[name] = stats
-        pd.DataFrame(defense._detection_history).to_csv(
-            f"{R}/{DEFENSE_NAME}_detections_{name.lower()}_{TAG}.csv", index=False)
+        pd.DataFrame(guard.log).to_csv(f"{R}/{DEFENSE_NAME}_turns_{name.lower()}_{VTAG}.csv", index=False)
+        print(f"  [SafeSplit] {name}: PDR {stats['PDR']:.1f}% ({stats['malicious_flagged']}/{stats['malicious_turns']}) | "
+              f"FPR {stats['FPR']:.1f}% ({stats['benign_flagged']}/{stats['benign_turns']}) | "
+              f"rollbacks {stats['rollbacks']} | skipped {stats['skipped']}")
 
-    # 1 ── White-Box ────────────────────────────────────────────────────
     def attack_whitebox():
-        atk = WhiteBoxInversionAttack(client_model=client_model, dataset=Config.DATASET,
-                                      iterations=ITERATIONS, lr=1e-2)
-        tracker, done, vis_o, vis_r = AttackMetricsTracker(), 0, None, None
+        atk = WhiteBoxInversionAttack(client_model=client_model, dataset=Config.DATASET, iterations=ITERATIONS, lr=1e-2)
+        tracker, done = AttackMetricsTracker(), 0
         for inputs, _ in test_loader:
             if done >= MAX_IMAGES:
                 break
@@ -417,67 +428,37 @@ if __name__ == "__main__":
             with torch.no_grad():
                 smashed = client_model(inputs)
             rec = atk.reconstruct(smashed, inputs.shape)
-            den = torch.clamp(inputs * std + mean, 0, 1)
-            tracker.log_batch(den, rec)
-            if vis_o is None:
-                vis_o, vis_r = den[:8].cpu(), rec[:8].cpu()
+            tracker.log_batch(torch.clamp(inputs * std + mean, 0, 1), rec)
             done += inputs.shape[0]
         s = tracker.get_summary()
-        if vis_o is not None:
-            save_ae_attack_visualization(originals=vis_o, reconstructed=vis_r, baseline_summary=s,
-                                         defense_summary=s, defense_name=f"WhiteBox_SafeSplit_{TAG}",
-                                         dataset=Config.DATASET, results_dir=R)
-        pd.DataFrame([s]).to_csv(f"{R}/{DEFENSE_NAME}_attack_whitebox_{TAG}.csv", index=False)
+        pd.DataFrame([s]).to_csv(f"{R}/{DEFENSE_NAME}_attack_whitebox_{VTAG}.csv", index=False)
         print(f"  PSNR {s['mean_psnr']:.2f} dB | SSIM {s['mean_ssim']:.4f}")
         return s
 
-    # 2 ── UnSplit ──────────────────────────────────────────────────────
     def attack_unsplit():
-        atk = UnSplitAttack(client_model=client_model, in_channels=in_channels,
-                            clone_builder=build_fresh_client,
-                            main_iters=Config.unsplit_main_iters,
-                            input_iters=Config.unsplit_input_iters,
+        atk = UnSplitAttack(client_model=client_model, in_channels=in_channels, clone_builder=build_client,
+                            main_iters=Config.unsplit_main_iters, input_iters=Config.unsplit_input_iters,
                             model_iters=Config.unsplit_model_iters)
         s = atk.run_attack(test_loader, num_batches=MAX_IMAGES // 32 or 1)
-        src = f"{R}/{Config.MODEL_NAME.lower()}_unsplit_no_defense.png"     # hard-coded name in the attack
-        dst = f"{R}/{DEFENSE_NAME}_unsplit_{TAG}.png"
-        if os.path.exists(src):
-            if os.path.exists(dst):
-                os.remove(dst)
-            os.rename(src, dst)
-        pd.DataFrame([s]).to_csv(f"{R}/{DEFENSE_NAME}_attack_unsplit_{TAG}.csv", index=False)
+        pd.DataFrame([s]).to_csv(f"{R}/{DEFENSE_NAME}_attack_unsplit_{VTAG}.csv", index=False)
         print(f"  PSNR {s['psnr']:.2f} dB | SSIM {s['ssim']:.4f}")
         return s
 
-    # 3 ── AE decoder ───────────────────────────────────────────────────
     def attack_ae():
-        s, o, r = run_ae_decoder_attack(client_model=client_model, train_loader=train_loader,
-                                        test_loader=test_loader, device=device, dataset=Config.DATASET,
-                                        preprocess_fn=None, ae_epochs=50,
+        s, o, r = run_ae_decoder_attack(client_model=client_model, train_loader=train_loader, test_loader=test_loader,
+                                        device=device, dataset=Config.DATASET, preprocess_fn=None, ae_epochs=50,
                                         label=f'{Config.MODEL_NAME} SafeSplit AE Decoder')
-        pd.DataFrame([s]).to_csv(f"{R}/{DEFENSE_NAME}_attack_ae_decoder_{TAG}.csv", index=False)
-        if len(o) > 0:
-            save_ae_attack_visualization(originals=o, reconstructed=r, baseline_summary=s,
-                                         defense_summary=s, defense_name=f"SafeSplit-{TAG}",
-                                         dataset=Config.DATASET, results_dir=R)
+        pd.DataFrame([s]).to_csv(f"{R}/{DEFENSE_NAME}_attack_ae_decoder_{VTAG}.csv", index=False)
         return s
 
-    # 4 ── FSHA ─────────────────────────────────────────────────────────
     def attack_fsha():
         atk = FSHAAttack(client_model=client_model, in_channels=in_channels, dataset=Config.DATASET,
-                         pilot_builder=build_fresh_client, critic_iters=CRITIC_ITERS)
+                         pilot_builder=build_client, critic_iters=CRITIC_ITERS)
         atk.hijack(train_loader, test_loader, epochs=HIJACK_EPOCHS)
         s = atk.reconstruct(train_loader, num_images=MAX_IMAGES)
-        src = f"{R}/fsha_no_defense.png"                                      # hard-coded name in the attack
-        dst = f"{R}/fsha_{DEFENSE_NAME}_{TAG}.png"
-        if os.path.exists(src):
-            if os.path.exists(dst):
-                os.remove(dst)
-            os.rename(src, dst)
-        pd.DataFrame([s]).to_csv(f"{R}/{DEFENSE_NAME}_attack_fsha_{TAG}.csv", index=False)
+        pd.DataFrame([s]).to_csv(f"{R}/{DEFENSE_NAME}_attack_fsha_{VTAG}.csv", index=False)
         return s
 
-    # 5 ── Label leakage ────────────────────────────────────────────────
     def attack_label_leakage():
         btr, bte = build_binary_split_loaders(train_loader.dataset, target_class=POSITIVE_CLASS,
                                               positive_ratio=POSITIVE_RATIO, batch_size=LEAKAGE_BATCH)
@@ -485,74 +466,77 @@ if __name__ == "__main__":
         atk = GradientNormLabelLeakageAttack(client_model=lc, server_model=ls, dataset=Config.DATASET,
                                              target_class=POSITIVE_CLASS, learning_rate=LEAKAGE_LR)
         s = atk.run(btr, bte, epochs=LEAKAGE_EPOCHS)
-        atk.save_visualization(tag=f"{DEFENSE_NAME}_{TAG}")
-        pd.DataFrame([s]).to_csv(f"{R}/{DEFENSE_NAME}_attack_label_leakage_{TAG}.csv", index=False)
-        pd.DataFrame(atk.history).to_csv(f"{R}/{DEFENSE_NAME}_label_leakage_batches_{TAG}.csv", index=False)
+        pd.DataFrame([s]).to_csv(f"{R}/{DEFENSE_NAME}_attack_label_leakage_{VTAG}.csv", index=False)
         return s
 
-    # 6 ── VILLAIN (SafeSplit monitors the injection phase, one epoch per turn) ──
     def attack_villain():
         idx_loader = build_indexed_loader(train_loader.dataset, batch_size=VILLAIN_BATCH, shuffle=True)
         vc, vs = build_fresh_split(num_classes=Config.NUM_CLASSES)
         atk = VILLAINBackdoorAttack(client_model=vc, server_model=vs, base_dataset=train_loader.dataset,
-                                    dataset=Config.DATASET, num_classes=Config.NUM_CLASSES,
-                                    target_label=TARGET_LABEL, beta=TRIGGER_BETA,
-                                    trigger_fraction=TRIGGER_FRACTION, dropout_keep=DROPOUT_KEEP,
-                                    gamma_low=GAMMA_LOW, gamma_high=GAMMA_HIGH,
-                                    poison_rate=POISON_RATE, candidates_per_batch=CANDIDATES)
+                                    dataset=Config.DATASET, num_classes=Config.NUM_CLASSES, target_label=TARGET_LABEL,
+                                    beta=TRIGGER_BETA, trigger_fraction=TRIGGER_FRACTION, dropout_keep=DROPOUT_KEEP,
+                                    gamma_low=GAMMA_LOW, gamma_high=GAMMA_HIGH, poison_rate=POISON_RATE,
+                                    candidates_per_batch=CANDIDATES)
         atk.warmup(idx_loader, epochs=WARMUP_EPOCHS)
         base, _ = atk.evaluate(test_loader)
-        print(f"  Clean accuracy before attack: {base:.2f}%")
         atk.infer_labels(idx_loader, epochs=INFERENCE_EPOCHS)
         atk.fabricate_trigger(idx_loader)
 
-        defense = make_defense(atk.server_model, device, benign_hist)
-        stats = guarded_epochs(
-            atk, defense, INJECTION_EPOCHS,
-            run_epoch=lambda: atk.inject_backdoor(idx_loader, test_loader, epochs=1),
-            test_loader=test_loader, label='VILLAIN')
-        record_activity('VILLAIN', defense, stats)
+        def benign_epoch():
+            atk.client_model.train(); atk.server_model.train()
+            for x, y, _ in tqdm(idx_loader, desc="  benign turn", leave=False):
+                atk._split_step(x.to(atk.device), y.to(atk.device))
 
+        guard = SafeSplitGuard(args, atk.server_model, device)
+        atk._set_client_learning_rate(atk.attack_learning_rate)
+        seed_history(guard, atk, benign_epoch, args.seed_turns)
+        stats = guarded_turns(atk, guard, make_schedule(INJECTION_EPOCHS, args.pmr, args.seed),
+                              malicious_epoch=lambda: atk.inject_backdoor(idx_loader, test_loader, epochs=1),
+                              benign_epoch=benign_epoch, test_loader=test_loader, label='VILLAIN',
+                              turn0=args.seed_turns)
+        record_activity('VILLAIN', guard, stats)
         s = atk.summarise(test_loader=test_loader, clean_baseline=base)
-        atk.save_visualization(tag=f"{DEFENSE_NAME}_{TAG}")
         pd.DataFrame([{**s, **{f'safesplit_{k}': v for k, v in stats.items()}}]).to_csv(
-            f"{R}/{DEFENSE_NAME}_attack_villain_{TAG}.csv", index=False)
-        pd.DataFrame(atk.history).to_csv(f"{R}/{DEFENSE_NAME}_villain_epochs_{TAG}.csv", index=False)
+            f"{R}/{DEFENSE_NAME}_attack_villain_{VTAG}.csv", index=False)
         return s
 
-    # 7/8 ── Backdoor poisoning (client: monitored; server: attacker IS the server) ──
     def attack_backdoor(mode):
         def _run():
             bc, bs = build_fresh_split(num_classes=Config.NUM_CLASSES)
-            kw = dict(client_model=bc, server_model=bs, base_dataset=train_loader.dataset,
-                      dataset=Config.DATASET, num_classes=Config.NUM_CLASSES, mode=mode,
-                      target_label=BD_TARGET, poison_rate=BD_RATE, patch_size=BD_PATCH,
-                      trigger_value=BD_TRIG, model_tag=f"{DEFENSE_NAME}_{Config.MODEL_NAME.lower()}_sl")
+            kw = dict(client_model=bc, server_model=bs, base_dataset=train_loader.dataset, dataset=Config.DATASET,
+                      num_classes=Config.NUM_CLASSES, mode=mode, target_label=BD_TARGET, poison_rate=BD_RATE,
+                      patch_size=BD_PATCH, trigger_value=BD_TRIG,
+                      model_tag=f"{DEFENSE_NAME}_{args.variant}_{Config.MODEL_NAME.lower()}_sl")
             if mode == 'server':
-                kw['surrogate_builder'] = build_fresh_client
+                kw['surrogate_builder'] = build_client
             atk = BackdoorPoisonAttack(**kw)
-
             extra = {}
             if mode == 'server':
                 atk.pretrain_server_backdoor(test_loader, epochs=BD_SURR_EPOCHS)
-                print("  [SafeSplit] NOT applicable: the attacker is the server that runs SafeSplit. "
-                      "Running the attack unmonitored.")
+                print("  [SafeSplit] NOT applicable: the attacker is the server. Running unmonitored.")
                 atk.train(train_loader, test_loader, epochs=BD_EPOCHS)
             else:
-                defense = make_defense(atk.server_model, device, benign_hist)
-                stats = guarded_epochs(
-                    atk, defense, BD_EPOCHS,
-                    run_epoch=lambda: atk.train(train_loader, test_loader, epochs=1),
-                    test_loader=test_loader, label='Backdoor(Client)')
-                record_activity('BackdoorPoison_Client', defense, stats)
-                extra = {f'safesplit_{k}': v for k, v in stats.items()}
+                def benign_epoch():
+                    atk.client_model.train(); atk.server_model.train()
+                    for x, y in tqdm(train_loader, desc="  benign turn", leave=False):
+                        atk._split_step(x.to(atk.device), y.to(atk.device))
 
+                def malicious_epoch():
+                    atk.client_model.train(); atk.server_model.train()
+                    for x, y in tqdm(train_loader, desc="  poisoned turn", leave=False):
+                        x, y, _ = atk._poison_batch(x.to(atk.device), y.to(atk.device))
+                        atk._split_step(x, y)
+
+                guard = SafeSplitGuard(args, atk.server_model, device)
+                seed_history(guard, atk, benign_epoch, args.seed_turns)
+                stats = guarded_turns(atk, guard, make_schedule(BD_EPOCHS, args.pmr, args.seed),
+                                      malicious_epoch=malicious_epoch, benign_epoch=benign_epoch,
+                                      test_loader=test_loader, label='Backdoor(Client)', turn0=args.seed_turns)
+                record_activity('BackdoorPoison_Client', guard, stats)
+                extra = {f'safesplit_{k}': v for k, v in stats.items()}
             s = atk.summarise()
-            atk.save_visualization(tag=f"{DEFENSE_NAME}_{TAG}")
-            pd.DataFrame([{**s, **extra}]).to_csv(
-                f"{R}/{DEFENSE_NAME}_attack_backdoor_poison_{mode}_{TAG}.csv", index=False)
-            pd.DataFrame(atk.history).to_csv(
-                f"{R}/{DEFENSE_NAME}_backdoor_poison_{mode}_epochs_{TAG}.csv", index=False)
+            pd.DataFrame([{**s, **extra}]).to_csv(f"{R}/{DEFENSE_NAME}_attack_backdoor_poison_{mode}_{VTAG}.csv",
+                                                  index=False)
             return s
         return _run
 
@@ -565,97 +549,50 @@ if __name__ == "__main__":
     run_attack('BackdoorPoison_Client', 'BACKDOOR POISONING (CLIENT)', attack_backdoor('client'))
     run_attack('BackdoorPoison_Server', 'BACKDOOR POISONING (SERVER)', attack_backdoor('server'))
 
-    # ── Consistency check: every one of the 8 attacks has a result or a recorded failure
-    accounted = set(results) | set(failures)
-    assert accounted == set(EXPECTED_ATTACKS), f"Attacks unaccounted for: {set(EXPECTED_ATTACKS) - accounted}"
-    print(f"\n  [check] 8/8 attacks accounted for: {len(results)} succeeded, {len(failures)} failed")
-    if failures:
-        pd.DataFrame([{'defense': DEFENSE_NAME, 'attack': k, 'error': v} for k, v in failures.items()]
-                     ).to_csv(f"{R}/{DEFENSE_NAME}_FAILURES_{TAG}.csv", index=False)
+    # ── summary table (same layout as zorro_run.py) ───────────────────────
+    METRICS = {'WhiteBox': {'psnr': 'mean_psnr', 'ssim': 'mean_ssim'}, 'UnSplit': {'psnr': 'psnr', 'ssim': 'ssim'},
+               'AE_Decoder': {'psnr': 'mean_psnr', 'ssim': 'mean_ssim'},
+               'FSHA': {'psnr': 'psnr', 'ssim': 'ssim', 'mse': 'mse'},
+               'LabelLeakage': {'auc': 'q95_norm_leak_auc_cut'},
+               'VILLAIN': {'lia': 'lia', 'asr': 'asr', 'cda': 'cda'},
+               'BackdoorPoison_Client': {'asr': 'asr', 'cda': 'cda'}, 'BackdoorPoison_Server': {'asr': 'asr', 'cda': 'cda'}}
+    COLS = [('psnr', 'PSNR', 2), ('ssim', 'SSIM', 4), ('mse', 'MSE', 5), ('auc', 'LeakAUC', 4),
+            ('lia', 'LIA%', 2), ('asr', 'ASR%', 2), ('cda', 'CDA%', 2)]
 
-    # ═════════════════════════════════════════════════════════════════════
-    #  Summary table  (— = metric not applicable; ERR = attack failed)
-    # ═════════════════════════════════════════════════════════════════════
-    METRICS = {
-        'WhiteBox':              {'psnr': 'mean_psnr', 'ssim': 'mean_ssim'},
-        'UnSplit':               {'psnr': 'psnr', 'ssim': 'ssim'},
-        'AE_Decoder':            {'psnr': 'mean_psnr', 'ssim': 'mean_ssim'},
-        'FSHA':                  {'psnr': 'psnr', 'ssim': 'ssim', 'mse': 'mse'},
-        'LabelLeakage':          {'auc': 'q95_norm_leak_auc_cut'},
-        'VILLAIN':               {'lia': 'lia', 'asr': 'asr', 'cda': 'cda'},
-        'BackdoorPoison_Client': {'asr': 'asr', 'cda': 'cda'},
-        'BackdoorPoison_Server': {'asr': 'asr', 'cda': 'cda'},
-    }
-    LABELS = {'WhiteBox': 'White-Box', 'UnSplit': 'UnSplit', 'AE_Decoder': 'AE Decoder', 'FSHA': 'FSHA',
-              'LabelLeakage': 'Label Leakage', 'VILLAIN': 'VILLAIN',
-              'BackdoorPoison_Client': 'Backdoor(Client)', 'BackdoorPoison_Server': 'Backdoor(Server)'}
-    COLS = [('psnr', 'PSNR (dB)', 2), ('ssim', 'SSIM', 4), ('mse', 'MSE', 5),
-            ('auc', 'Leak AUC', 4), ('lia', 'LIA (%)', 2), ('asr', 'ASR (%)', 2), ('cda', 'CDA (%)', 2)]
-
-    def cell(attack, col, dec):
-        if col not in METRICS[attack]:
+    def cell(a, col, dec):
+        if col not in METRICS[a] or a not in selected:
             return BLANK
-        if attack in failures:
+        if a in failures:
             return "ERR"
-        v = results[attack].get(METRICS[attack][col])
+        if a not in results:
+            return BLANK
+        v = results[a].get(METRICS[a][col])
         return "MISSING" if v is None else f"{float(v):.{dec}f}"
 
-    W = 96
-    print("\n" + "=" * W)
-    print(f"    SAFESPLIT — {Config.MODEL_NAME} | cut layer {Config.CUT_LAYER} | {Config.DATASET} | "
-          f"clean accuracy {clean_acc:.2f}%")
-    print("=" * W)
-    print(f"{'Attack':<20}" + "".join(f"{h:>11}" for _, h, _ in COLS))
-    print("-" * W)
+    W = 100
+    print("\n" + "=" * W + f"\n    SAFESPLIT[{args.variant}] — {Config.MODEL_NAME} | cut {Config.CUT_LAYER} | "
+          f"clean acc {clean_acc:.2f}%\n" + "=" * W)
+    print(f"{'Attack':<24}" + "".join(f"{h:>10}" for _, h, _ in COLS))
     for a in EXPECTED_ATTACKS:
-        print(f"  {LABELS[a]:<18}" + "".join(f"{cell(a, c, d):>11}" for c, _, d in COLS))
-    print("=" * W)
-    for a, msg in failures.items():
-        print(f"  FAILED  {LABELS[a]}: {msg}")
-
-    print("\n  SafeSplit in the loop?")
-    for a in EXPECTED_ATTACKS:
-        print(f"    {LABELS[a]:<18} {DEFENSE_ACTIVE[a]}")
-
-    print("\n" + "-" * W + "\n    SAFESPLIT ACTIVITY (flags / rollbacks / skipped turns)\n" + "-" * W)
-    if train_stats:
-        print(f"  {'Benign training':<24} flagged {train_stats['flagged_as_poisoned']}/"
-              f"{train_stats['total_clients_analyzed']} turns "
-              f"(false positives), rollbacks {train_stats['rollbacks_performed']}, "
-              f"skipped {train_stats['skipped_turns']}")
+        print(f"  {a:<22}" + "".join(f"{cell(a, c_, d):>10}" for c_, _, d in COLS))
     for name, st in activity.items():
-        print(f"  {LABELS[name]:<24} accepted {st['accepted']}, flagged/rolled back {st['rolled_back']} "
-              f"(turns {st['flagged_epochs']}), skipped {st['skipped']}")
-    print("-" * W)
-
-    print("\n" + "-" * W + "\n    LABEL LEAKAGE DETAIL (95% quantile leak AUC over batches) — SAFESPLIT\n" + "-" * W)
-    if 'LabelLeakage' in results:
-        ll = results['LabelLeakage']
-        for label, key in [('Norm (cut layer)', 'q95_norm_leak_auc_cut'),
-                           ('Cosine (cut layer)', 'q95_cosine_leak_auc_cut'),
-                           ('Norm (first layer)', 'q95_norm_leak_auc_first'),
-                           ('Cosine (first layer)', 'q95_cosine_leak_auc_first'),
-                           ('Majority counting accuracy', 'q95_majority_accuracy_cut')]:
-            print(f"  {label:<28} {ll[key]:>10.4f}")
-    else:
-        print(f"  Label leakage failed: {failures.get('LabelLeakage')}")
-    print("-" * W)
+        print(f"  SAFESPLIT activity {name}: PDR {st['PDR']:.1f}% | FPR {st['FPR']:.1f}% | "
+              f"rollbacks {st['rollbacks']} | skipped {st['skipped']} | first detection turn {st['first_detection_turn']}")
+    for a, msg in failures.items():
+        print(f"  FAILED  {a}: {msg}")
 
     rows = []
-    for a in EXPECTED_ATTACKS:
-        row = {'defense': DEFENSE_NAME, 'model': Config.MODEL_NAME, 'cut_layer': Config.CUT_LAYER,
-               'dataset': Config.DATASET, 'seed': args.seed, 'clean_acc': clean_acc, 'attack': a,
-               'safesplit_in_loop': DEFENSE_ACTIVE[a],
-               'status': 'FAILED' if a in failures else 'ok', 'error': failures.get(a)}
-        for c, _, _ in COLS:
-            row[c] = None if (c not in METRICS[a] or a in failures) else results[a].get(METRICS[a][c])
+    for a in selected:
+        row = {'defense': DEFENSE_NAME, 'variant': args.variant, 'model': Config.MODEL_NAME,
+               'cut_layer': Config.CUT_LAYER, 'dataset': Config.DATASET, 'seed': args.seed, 'clean_acc': clean_acc,
+               'attack': a, 'safesplit_in_loop': DEFENSE_ACTIVE[a], 'pmr': args.pmr,
+               'status': 'FAILED' if a in failures else 'ok', 'error': failures.get(a),
+               **{f'cfg_{k}': v for k, v in cfg_of(args).items()}}
+        for c_, _, _ in COLS:
+            row[c_] = None if (c_ not in METRICS[a] or a in failures or a not in results) else results[a].get(METRICS[a][c_])
         if a in activity:
-            row.update({f'safesplit_{k}': str(v) for k, v in activity[a].items()})
-        if a == 'LabelLeakage' and a in results:
-            for k in ('q95_norm_leak_auc_cut', 'q95_cosine_leak_auc_cut', 'q95_norm_leak_auc_first',
-                      'q95_cosine_leak_auc_first', 'q95_majority_accuracy_cut'):
-                row[k] = results[a].get(k)
+            row.update({f'safesplit_{k}': v for k, v in activity[a].items()})
         rows.append(row)
-    out = f"{R}/{DEFENSE_NAME}_all_attacks_{TAG}.csv"
+    out = f"{R}/{DEFENSE_NAME}_all_attacks_{VTAG}.csv"
     pd.DataFrame(rows).to_csv(out, index=False)
-    print(f"\n  Combined SafeSplit results saved → {out}")
+    print(f"\n  Saved → {out}")

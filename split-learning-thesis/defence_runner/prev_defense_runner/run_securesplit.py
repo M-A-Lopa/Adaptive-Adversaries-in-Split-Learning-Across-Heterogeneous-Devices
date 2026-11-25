@@ -6,7 +6,10 @@ import random
 import argparse
 import traceback
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_r = os.path.dirname(os.path.abspath(__file__))
+while not os.path.exists(os.path.join(_r, 'config.py')) and os.path.dirname(_r) != _r:
+    _r = os.path.dirname(_r)
+sys.path.insert(0, _r)
 
 # SecureSplitDefense prints emoji; legacy Windows code pages would raise UnicodeEncodeError.
 for _s in (sys.stdout, sys.stderr):

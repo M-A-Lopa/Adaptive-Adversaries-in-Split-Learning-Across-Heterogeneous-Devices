@@ -9,9 +9,6 @@ from collections import defaultdict
 from typing import Tuple, Optional, List
 
 
-# ─────────────────────────────────────────────────────────────
-# Step 1: Dimensionality Transformation
-# ─────────────────────────────────────────────────────────────
 
 class DimensionalityTransformer:
     
@@ -25,14 +22,12 @@ class DimensionalityTransformer:
         self.random_state = random_state
         self.is_fitted = False
         
-        # PCA for all methods (base)
         self.pca = PCA(
             n_components=min(target_dim, 50),
             random_state=random_state
         )
         self.scaler = StandardScaler()
         
-        # PKT-style kernel matrix
         self._kernel_matrix = None
         
         print(f"[SecureSplit] Transformer: method={method}, "
@@ -40,11 +35,9 @@ class DimensionalityTransformer:
     
     def fit(self, embeddings: np.ndarray):
         
-        # Standardize first
         emb_scaled = self.scaler.fit_transform(embeddings)
         
         if self.method == 'pca':
-            # Simple PCA reduction
             n_comp = min(self.target_dim, 
                         min(embeddings.shape))
             self.pca = PCA(n_components=n_comp,
@@ -63,7 +56,6 @@ class DimensionalityTransformer:
             np.random.seed(self.random_state)
             input_dim = embeddings.shape[1]
             
-            # Random projection matrix for RFF
             self._omega = np.random.randn(
                 input_dim, self.target_dim // 2) / np.sqrt(input_dim)
             self._bias = np.random.uniform(
@@ -83,16 +75,12 @@ class DimensionalityTransformer:
             return self.pca.transform(emb_scaled)
         
         elif self.method == 'umap_style':
-            # PCA → nonlinear activation
             pca_out = self.pca.transform(emb_scaled)
-            # Tanh nonlinearity — separates clusters better
             transformed = np.tanh(pca_out)
             return transformed
         
         elif self.method == 'pkt_style':
-            # Random Fourier Features (kernel expansion)
             proj = emb_scaled @ self._omega + self._bias
-            # cos and sin features
             rff = np.concatenate([
                 np.cos(proj), np.sin(proj)
             ], axis=1)
@@ -105,10 +93,6 @@ class DimensionalityTransformer:
         self.fit(embeddings)
         return self.transform(embeddings)
 
-
-# ─────────────────────────────────────────────────────────────
-# Step 2: Adaptive Majority-Based Voting Filter
-# ─────────────────────────────────────────────────────────────
 
 class MajorityVotingFilter:
     
@@ -129,18 +113,13 @@ class MajorityVotingFilter:
                         embeddings: np.ndarray,
                         n_clusters: int,
                         n_iter: int = 100) -> np.ndarray:
-        """
-        Simple K-means clustering (sklearn ছাড়া)।
-        
-        Returns: cluster assignments (N,)
-        """
+
         N, D = embeddings.shape
         n_clusters = min(n_clusters, N)
         
         if n_clusters <= 1:
             return np.zeros(N, dtype=int)
         
-        # Random initialization
         np.random.seed(42)
         idx = np.random.choice(N, n_clusters, replace=False)
         centers = embeddings[idx].copy()
@@ -148,11 +127,10 @@ class MajorityVotingFilter:
         assignments = np.zeros(N, dtype=int)
         
         for _ in range(n_iter):
-            # Assign to nearest center
             dists = np.array([
                 np.linalg.norm(embeddings - c, axis=1) 
                 for c in centers
-            ]).T  # (N, K)
+            ]).T  
             
             new_assignments = np.argmin(dists, axis=1)
             
@@ -161,7 +139,6 @@ class MajorityVotingFilter:
             
             assignments = new_assignments
             
-            # Update centers
             for k in range(n_clusters):
                 mask = (assignments == k)
                 if mask.sum() > 0:
@@ -176,28 +153,22 @@ class MajorityVotingFilter:
         rejection_votes = np.zeros(N)
         
         for round_idx in range(self.voting_rounds):
-            # K-means clustering
             assignments = self._kmeans_cluster(
                 embeddings, self.n_clusters)
             
-            # Count cluster sizes
             cluster_sizes = np.bincount(
                 assignments, minlength=self.n_clusters)
             
-            # Majority cluster = largest cluster
             majority_cluster = np.argmax(cluster_sizes)
             
-            # Minority clusters = potentially poisoned
             for k in range(self.n_clusters):
                 if k != majority_cluster:
                     minority_mask = (assignments == k)
                     minority_ratio = minority_mask.sum() / N
                     
-                    # Only vote to reject if minority is small enough
                     if minority_ratio <= 0.5 - self.rejection_threshold:
                         rejection_votes[minority_mask] += 1
         
-        # Reject if majority of rounds voted to reject
         rejection_mask = rejection_votes > (self.voting_rounds / 2)
         
         return rejection_mask
@@ -216,22 +187,16 @@ class MajorityVotingFilter:
             class_embs = transformed_emb[class_mask]
             
             if len(class_embs) < self.n_clusters * 2:
-                # Too few samples — skip filtering
                 continue
             
-            # Get rejection decisions for this class
             class_rejection = self.filter_class(class_embs)
             
-            # Map back to original indices
             class_indices = np.where(class_mask)[0]
             rejection_mask[class_indices] = class_rejection
         
         return rejection_mask
 
 
-# ─────────────────────────────────────────────────────────────
-# Main SecureSplit Defense
-# ─────────────────────────────────────────────────────────────
 
 class SecureSplitDefense:
     
@@ -259,13 +224,11 @@ class SecureSplitDefense:
         self._total_rejected = 0
         self._total_processed = 0
         
-        # Step 1: Transformer
         self.transformer = DimensionalityTransformer(
             method=transform_method,
             target_dim=target_dim
         )
         
-        # Step 2: Filter
         self.voting_filter = MajorityVotingFilter(
             n_clusters=n_clusters,
             voting_rounds=voting_rounds,
@@ -284,13 +247,11 @@ class SecureSplitDefense:
         print(f"{'='*55}\n")
     
     def _to_numpy(self, tensor: torch.Tensor) -> np.ndarray:
-        """Tensor → numpy (flatten if needed)."""
         if tensor.dim() > 2:
             tensor = tensor.view(tensor.shape[0], -1)
         return tensor.detach().cpu().numpy()
     
     def _fit_transformer(self):
-        """Collected buffer দিয়ে transformer fit করে।"""
         if not self._fit_buffer_emb:
             return
         
@@ -311,22 +272,17 @@ class SecureSplitDefense:
         emb_np = self._to_numpy(embeddings)
         lbl_np = labels.detach().cpu().numpy()
         
-        # ── WARMUP PHASE ─────────────────────────────────────
         if not self._is_fitted:
-            # Collect data for fitting
             self._fit_buffer_emb.append(emb_np)
             self._fit_buffer_lbl.append(lbl_np)
             
             if self._batch_count >= self.warmup_batches:
                 self._fit_transformer()
             
-            # During warmup: accept all
             identity_mask = torch.zeros(
                 len(labels), dtype=torch.bool)
             return embeddings, labels, identity_mask
-        
-        # ── ACTIVE DEFENSE PHASE ─────────────────────────────
-        # Step 1: Transform embeddings
+
         try:
             transformed = self.transformer.transform(emb_np)
         except Exception as e:
@@ -334,22 +290,18 @@ class SecureSplitDefense:
             identity_mask = torch.zeros(len(labels), dtype=torch.bool)
             return embeddings, labels, identity_mask
         
-        # Step 2: Majority voting filter
         rejection_np = self.voting_filter.filter(transformed, lbl_np)
         rejection_mask = torch.tensor(rejection_np, dtype=torch.bool)
         
-        # Keep non-rejected samples
         keep_mask = ~rejection_mask
         
         if keep_mask.sum() == 0:
-            # Safety: if all rejected, keep all
             keep_mask = torch.ones(len(labels), dtype=torch.bool)
             rejection_mask = torch.zeros(len(labels), dtype=torch.bool)
         
         clean_embeddings = embeddings[keep_mask]
         clean_labels = labels[keep_mask]
         
-        # Track statistics
         n_rejected = rejection_mask.sum().item()
         self._total_rejected += n_rejected
         self._total_processed += len(labels)
@@ -364,11 +316,9 @@ class SecureSplitDefense:
         return clean_embeddings, clean_labels, rejection_mask
     
     def is_active(self) -> bool:
-        """Defense active কিনা।"""
         return self._is_fitted
     
     def get_stats(self) -> dict:
-        """Defense statistics।"""
         rejection_rate = (self._total_rejected / 
                          max(1, self._total_processed) * 100)
         return {
@@ -391,10 +341,6 @@ class SecureSplitDefense:
         print(f"  Batches seen     : {stats['batches_processed']}\n")
 
 
-# ─────────────────────────────────────────────────────────────
-# Multi-Cut-Layer SecureSplit
-# ─────────────────────────────────────────────────────────────
-
 class SecureSplitManager:
     
     
@@ -404,7 +350,6 @@ class SecureSplitManager:
                  warmup_batches: int = 30,
                  device: str = 'cpu'):
         
-        # Embedding dims for PyramidCNN
         emb_dims = {
             1: 32 * 32 * 32,   # 32768
             2: 64 * 16 * 16,   # 16384
@@ -417,7 +362,6 @@ class SecureSplitManager:
         
         for cl in cut_layers:
             dim = emb_dims.get(cl, 16384)
-            # Target dim scales with cut layer
             target_dim = max(32, 64 // cl)
             
             self.defenses[cl] = SecureSplitDefense(
@@ -430,15 +374,10 @@ class SecureSplitManager:
             )
     
     def get_defense(self, cut_layer: int) -> SecureSplitDefense:
-        """Get defense for specific cut layer."""
         if cut_layer not in self.defenses:
             raise ValueError(f"No defense for cut_layer={cut_layer}")
         return self.defenses[cut_layer]
 
-
-# ─────────────────────────────────────────────────────────────
-# Quick Test
-# ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     print("=" * 55)
@@ -451,9 +390,8 @@ if __name__ == "__main__":
     num_classes = 10
     batch_size = 32
     cut_layer = 2
-    embedding_dim = 64 * 16 * 16  # PyramidCNN cut layer 2
+    embedding_dim = 64 * 16 * 16  
     
-    # Initialize defense
     defense = SecureSplitDefense(
         embedding_dim=embedding_dim,
         transform_method='umap_style',
@@ -480,17 +418,14 @@ if __name__ == "__main__":
     
     print("\n--- Phase 2: Normal vs Backdoor Detection ---")
     
-    # Normal batch
     normal_emb = torch.randn(batch_size, 64, 16, 16)
     normal_labels = torch.randint(0, num_classes, (batch_size,))
     clean_emb, clean_lbl, rejected = defense.filter(
         normal_emb, normal_labels)
     print(f"  Normal batch  → rejected: {rejected.sum().item()}/{batch_size}")
     
-    # Simulated VILLAIN backdoor
-    # Attacker adds trigger pattern to some embeddings
     villain_emb = torch.randn(batch_size, 64, 16, 16)
-    villain_emb[:6] = villain_emb[:6] + 3.5  # Trigger injection
+    villain_emb[:6] = villain_emb[:6] + 3.5 
     villain_labels = torch.randint(0, num_classes, (batch_size,))
     
     clean_emb, clean_lbl, rejected = defense.filter(
@@ -517,11 +452,9 @@ if __name__ == "__main__":
         emb = torch.randn(*shape)
         lbl = torch.randint(0, 10, (batch_size,))
         
-        # Warmup
         for _ in range(4):
             d.filter(emb, lbl)
         
-        # Test with backdoor
         emb_poisoned = emb.clone()
         emb_poisoned[:5] += 4.0
         _, _, rej = d.filter(emb_poisoned, lbl)

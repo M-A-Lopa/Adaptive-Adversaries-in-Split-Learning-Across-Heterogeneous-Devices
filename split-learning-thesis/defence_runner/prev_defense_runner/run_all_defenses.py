@@ -11,7 +11,9 @@ from datetime import datetime
 from xml.sax.saxutils import escape
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
+ROOT = HERE
+while not os.path.exists(os.path.join(ROOT, 'config.py')) and os.path.dirname(ROOT) != ROOT:
+    ROOT = os.path.dirname(ROOT)
 sys.path.insert(0, ROOT)
 
 
@@ -365,8 +367,8 @@ def missing_project_modules(runner_path):
     import importlib.util
     with open(runner_path, encoding="utf-8", errors="replace") as f:
         src = f.read()
-    names = set(re.findall(r"^\s*from\s+((?:all_|util)[\w.]*)\s+import", src, flags=re.M))
-    names |= set(re.findall(r"^\s*import\s+((?:all_|util)[\w.]*)", src, flags=re.M))
+    names = set(re.findall(r"^\s*from\s+((?:all_|util|attack_runner|existing_defense)[\w.]*)\s+import", src, flags=re.M))
+    names |= set(re.findall(r"^\s*import\s+((?:all_|util|attack_runner|existing_defense)[\w.]*)", src, flags=re.M))
     missing = []
     for name in sorted(names):
         try:

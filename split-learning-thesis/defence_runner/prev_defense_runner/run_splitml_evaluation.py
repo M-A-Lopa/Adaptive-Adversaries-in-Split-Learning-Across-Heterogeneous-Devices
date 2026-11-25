@@ -1,11 +1,14 @@
 import sys, os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_r = os.path.dirname(os.path.abspath(__file__))
+while not os.path.exists(os.path.join(_r, 'config.py')) and os.path.dirname(_r) != _r:
+    _r = os.path.dirname(_r)
+sys.path.append(_r)
 
 import torch
 import pandas as pd
 from config import Config
 from dataset import DatasetLoader
-from all_defences.splitml_defense import SplitMLDefense, OPENFHE_AVAILABLE
+from existing_defense.splitml_defense import SplitMLDefense, OPENFHE_AVAILABLE
 from all_split_learning.splitml_federated_learning import SplitMLTrainer, build_splitml_clients
 from all_attacks.ae_decoder_attack import run_ae_decoder_attack
 import numpy as np

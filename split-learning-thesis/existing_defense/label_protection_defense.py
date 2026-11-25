@@ -3,7 +3,7 @@ import time
 import torch
 import torch.nn as nn
 
-from all_defences.marvell_solver import solve_isotropic_covariance, symKL_objective
+from existing_defense.marvell_solver import solve_isotropic_covariance, symKL_objective
 
 
 OFFICIAL_NAME_MAP = {

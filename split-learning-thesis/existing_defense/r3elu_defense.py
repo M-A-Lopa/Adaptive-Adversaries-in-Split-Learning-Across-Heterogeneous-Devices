@@ -1,34 +1,9 @@
-"""
-R3eLU — Randomized-Response ReLU privacy tunnel for split learning.
-
-Paper : Y. Mao, Z. Xin, Z. Li, J. Hong, Q. Yang, S. Zhong,
-        "Secure Split Learning against Property Inference, Data Reconstruction,
-        and Feature Space Hijacking Attacks", ESORICS 2023 / arXiv:2304.09515.
-
-No official code was released by the authors. This file is a line-by-line
-implementation of the paper's Algorithm 1 (R3eLU-forward), Algorithm 2
-(R3eLU-backward), Eq.(4)/(6) (randomized-response probabilities),
-Eq.(8)/(9)/(10) (dynamic feature-importance budget allocation) and
-Corollary 4/5 (strong-composition privacy accounting).
-
-Paper defaults (Sec. 5): eps_p = eps_l = eps/2, K = N/2, C = 10,
-initial importance = 0 for all features.
-
-Roles:
-    guest (client) calls  R3eLU.forward   before sending smashed data
-    host  (server) calls  backward_perturb before sending the cut-layer grad
-"""
 import math
 import torch
 import torch.nn as nn
 
 
 def clip_k(v, K, C):
-    """
-    ClipK(v, C, K, N): keep the K largest entries of every row, zero the rest,
-    then clip each kept value into [0, C]  (Corollary 1: 0 <= v_hat_i <= C).
-    v : [B, N]
-    """
     N = v.shape[1]
     K = max(1, min(int(K), N))
     top_vals, top_idx = torch.topk(v, K, dim=1)
@@ -38,25 +13,16 @@ def clip_k(v, K, C):
 
 
 def rr_probability(ratio, eps_p, K):
-    """Eq.(4)/(6)/(10):  p_i = 1/2 + ratio_i * ( e^{eps_p/K} / (1+e^{eps_p/K}) - 1/2 )."""
     e = math.exp(eps_p / K)
     return 0.5 + ratio * (e / (1.0 + e) - 0.5)
 
 
 def sample_laplace(shape, scale, device):
-    """Lap(0, scale). `scale` may be a float or a broadcastable tensor."""
     u = torch.rand(shape, device=device) - 0.5
     return -scale * torch.sign(u) * torch.log1p(-2.0 * u.abs().clamp(max=0.5 - 1e-7))
 
 
 class DynamicImportance:
-    """
-    Sec. 3.4. First-order Taylor importance of every cut-layer neuron
-    (Eq. 8, Molchanov et al.) accumulated as a running mean over iterations (Eq. 9).
-    As stated in the paper, the O(N_u) cost comes from the product of the cut-layer
-    gradient and the neuron values, so  I_j = (grad_j * a_j)^2  summed over the batch.
-    Only the gradient the guest actually RECEIVES is used (post-processing, no extra leakage).
-    """
 
     def __init__(self, num_features, device):
         self.U = torch.zeros(num_features, device=device)
@@ -77,23 +43,11 @@ class DynamicImportance:
         return self.U / (self.U.max() + 1e-12)
 
     def laplace_weight(self, w_min=0.1):
-        # Eq.(16): feature j receives budget share  eps_l * U_j / sum(U).
-        # Normalised so the mean weight is 1 -> reduces exactly to Algorithm 1 when U is uniform.
         w = self.U / (self.U.mean() + 1e-12)
         return w.clamp(min=w_min)
 
 
 class R3eLUMechanism:
-    """
-    Holds the privacy parameters and implements both procedures.
-        epsilon        : total per-step budget eps = eps_p + eps_l  (paper splits it 50/50)
-        K              : top-K kept values (paper: half the number of features)
-        C              : clipping constant (paper: 10)
-        dynamic_budget : Sec. 3.4 importance-based allocation (paper: enabled)
-        iteration_decay: eps_i = eps_T / 2^i per iteration (Sec. 3.4, [Du et al.]).
-                         Off by default: after ~20 iterations the Laplace scale becomes astronomically
-                         large, so the paper's reported accuracies are only reachable without it.
-    """
 
     def __init__(self, num_features, epsilon=1.0, K=None, C=10.0, C_backward=None, dynamic_budget=True,
                  iteration_decay=False, protect_forward=True, protect_backward=True, device='cpu'):
@@ -112,24 +66,23 @@ class R3eLUMechanism:
 
     def _budgets(self):
         eps = self.epsilon / (2 ** (self.step + 1)) if self.iteration_decay else self.epsilon
-        return eps / 2.0, eps / 2.0          # eps_p, eps_l
+        return eps / 2.0, eps / 2.0
 
     def laplace_scale(self, C):
         _, eps_l = self._budgets()
-        return 2.0 * self.K * C / eps_l      # sensitivity 2KC (Corollary 1) / eps_l
+        return 2.0 * self.K * C / eps_l
 
     @torch.no_grad()
     def forward_perturb(self, v):
-        """Algorithm 1 (R3eLU-forward). v: raw cut-layer pre-activation, any shape [B, ...]."""
         shape = v.shape
         flat = v.reshape(shape[0], -1)
         eps_p, _ = self._budgets()
 
         v_hat = clip_k(flat, self.K, self.C)
         if self.dynamic_budget and self.importance.ready():
-            ratio = self.importance.ratio().unsqueeze(0).expand_as(v_hat)                  # Eq.(10)
+            ratio = self.importance.ratio().unsqueeze(0).expand_as(v_hat)
         else:
-            ratio = v_hat / (v_hat.abs().amax(dim=1, keepdim=True) + 1e-12)                # Eq.(4)
+            ratio = v_hat / (v_hat.abs().amax(dim=1, keepdim=True) + 1e-12)
         p = rr_probability(ratio, eps_p, self.K)
 
         scale = self.laplace_scale(self.C)
@@ -143,13 +96,12 @@ class R3eLUMechanism:
 
     @torch.no_grad()
     def backward_perturb(self, delta):
-        """Algorithm 2 (R3eLU-backward). delta: partial loss w.r.t. the cut layer, run by the HOST."""
         shape = delta.shape
         flat = delta.reshape(shape[0], -1)
         eps_p, _ = self._budgets()
 
         abs_hat = clip_k(flat.abs(), self.K, self.C_backward)
-        ratio = abs_hat / (abs_hat.amax(dim=1, keepdim=True) + 1e-12)                       # Eq.(6)
+        ratio = abs_hat / (abs_hat.amax(dim=1, keepdim=True) + 1e-12)
         p = rr_probability(ratio, eps_p, self.K)
 
         keep = torch.rand_like(p) < p
@@ -161,7 +113,6 @@ class R3eLUMechanism:
         self.step += 1
 
     def accountant(self, total_steps, sampling_ratio, delta=1e-5):
-        """Corollary 4/5 (strong composition): eps_total = g*e*sqrt(2T ln(1/d)) + g*e*T*(e^{g*e}-1)."""
         ge = sampling_ratio * self.epsilon
         return ge * math.sqrt(2 * total_steps * math.log(1 / delta)) + ge * total_steps * (math.exp(ge) - 1)
 
@@ -172,7 +123,6 @@ class R3eLUMechanism:
 
 
 class _R3eLUFunction(torch.autograd.Function):
-    """Forward: guest-side R3eLU-forward. Backward: pass-through (the host already perturbed the grad)."""
 
     @staticmethod
     def forward(ctx, v, mech):
@@ -191,7 +141,6 @@ class _R3eLUFunction(torch.autograd.Function):
 
 
 class R3eLU(nn.Module):
-    """Drop-in cut-layer activation. Train mode -> randomized response; eval mode -> same (DP at inference too)."""
 
     def __init__(self, mechanism):
         super().__init__()
@@ -202,10 +151,6 @@ class R3eLU(nn.Module):
 
 
 class R3eLUDefense:
-    """
-    Same interface as DPSLDefense so it works with SplitLearningTrainer.evaluate_with_defense()
-    and with the attack runners:  protected = defense.protect(smashed)
-    """
 
     def __init__(self, num_features, epsilon=1.0, **kw):
         self.mech = R3eLUMechanism(num_features, epsilon=epsilon, **kw)

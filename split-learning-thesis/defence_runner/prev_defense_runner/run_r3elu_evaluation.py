@@ -1,11 +1,14 @@
 import sys, os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_r = os.path.dirname(os.path.abspath(__file__))
+while not os.path.exists(os.path.join(_r, 'config.py')) and os.path.dirname(_r) != _r:
+    _r = os.path.dirname(_r)
+sys.path.append(_r)
 
 import torch
 import pandas as pd
 from config import Config
 from dataset import DatasetLoader
-from all_defences.r3elu_defense import R3eLUMechanism
+from existing_defense.r3elu_defense import R3eLUMechanism
 from all_split_learning.r3elu_split_learning import R3eLUSplitLearningTrainer
 from all_attacks.ae_decoder_attack import run_ae_decoder_attack
 import numpy as np
@@ -17,6 +20,32 @@ from all_model.pyramid_cnn import PyramidCNNClientModel, PyramidCNNServerModel
 from all_attacks.attacks_whitebox import WhiteBoxInversionAttack, AttackMetricsTracker
 from all_attacks.fsha_attack import FSHAAttack, gradient_penalty, compute_psnr, compute_ssim, compute_mse, \
     denormalize as fsha_denormalize
+from all_attacks.fora_attack import FORAAttack
+from all_attacks.similarity_label_attack import SimilarityLabelInferenceAttack
+from torch.utils.data import DataLoader
+import argparse
+from defence_runner.new_defense_runner import defended_eval as DE
+from all_attacks.pcat_attack import PCATAttack
+from all_attacks.property_inference_attack import MaoPropertyInference, PROPERTIES
+from all_attacks.membership_inference_attack import ShokriMembershipInference
+from util.split_env import load_raw_datasets
+PCAT_VANILLA_ITERS = 5000
+PROP_N_AUX = 5000
+PROP_N_EVAL = 10000
+PROP_EPOCHS = 30
+MIA_SHADOWS = 10
+MIA_TARGET = 2000
+_VALID = None
+SIM_EPOCHS = 1
+FORA_ITERS = 4000
+KEY_TO_VALID = {'whitebox':'whitebox','ae_decoder':'ae_decoder','fsha':'fsha','fora':'fora',
+                'label_leakage':'label_leakage','similarity_label':'similarity_label',
+                'poison_client':'backdoor_client','poison_server':'backdoor_server',
+                'pcat':'pcat','property':'property_inference','membership':'membership'}
+def attack_allowed(key):
+    if _VALID is None:
+        return True
+    return (KEY_TO_VALID.get(key, key), Config.DATASET, Config.MODEL_NAME, Config.CUT_LAYER) in _VALID
 
 
 def build_client(in_channels):
@@ -82,88 +111,15 @@ def run_whitebox_vs_view(client_model, view_fn, test_loader, device, dataset, ma
 class DefendedFSHAAttack(FSHAAttack):
 
     def __init__(self, *args, view_fn=None, tag='defended', **kw):
-        super().__init__(*args, **kw)
-        self.view_fn = view_fn if view_fn is not None else (lambda z: z)
-        self.tag = tag
-
-    def _observed(self, smashed):
-        return smashed + (self.view_fn(smashed) - smashed).detach()
-
-    def hijack(self, private_loader, public_loader, epochs=5):
-        print(f"\n  Running FSHA against defense view '{self.tag}' for {epochs} epoch(s)...")
-        self.client_model.train(); self.pilot.train(); self.decoder.train(); self.critic.train()
-        for epoch in range(epochs):
-            pub_iter = iter(public_loader)
-
-            def next_pub():
-                nonlocal pub_iter
-                try:
-                    x, _ = next(pub_iter)
-                except StopIteration:
-                    pub_iter = iter(public_loader)
-                    x, _ = next(pub_iter)
-                return x.to(self.device)
-
-            rc = rh = rr = 0.0
-            n = 0
-            for priv, _ in tqdm(private_loader, desc=f"  Hijack [{epoch+1}/{epochs}]", leave=False):
-                priv = priv.to(self.device)
-                pub = next_pub()
-                self.pilot_optimizer.zero_grad()
-                recon_loss = self.mse(self.decoder(self.pilot(pub)), pub)
-                recon_loss.backward()
-                self.pilot_optimizer.step()
-
-                with torch.no_grad():
-                    fake = self.view_fn(self.client_model(priv))
-                for _ in range(self.critic_iters):
-                    with torch.no_grad():
-                        real = self.pilot(next_pub())
-                    self.critic_optimizer.zero_grad()
-                    n = min(real.shape[0], fake.shape[0])
-                    gp = gradient_penalty(self.critic, real[:n], fake[:n], self.device)
-                    critic_loss = self.critic(fake[:n]).mean() - self.critic(real[:n]).mean() + self.gp_lambda * gp
-                    critic_loss.backward()
-                    self.critic_optimizer.step()
-
-                self.client_optimizer.zero_grad()
-                hijack_loss = -self.critic(self._observed(self.client_model(priv))).mean()
-                hijack_loss.backward()
-                self.client_optimizer.step()
-                rc += critic_loss.item(); rh += hijack_loss.item(); rr += recon_loss.item(); n += 1
-            print(f"  Epoch {epoch+1:2d}/{epochs} | Critic: {rc/n:.4f} | Hijack: {rh/n:.4f} | Pilot-Recon: {rr/n:.4f}")
-
-    def reconstruct(self, test_loader, num_images=32):
-        self.client_model.eval(); self.decoder.eval()
-        psnr, ssim, mse = [], [], []
-        vis_o = vis_r = None
-        seen = 0
-        with torch.no_grad():
-            for images, _ in test_loader:
-                if seen >= num_images:
-                    break
-                images = images[:num_images - seen].to(self.device)
-                rec = self.decoder(self.view_fn(self.client_model(images))).clamp(0, 1)
-                orig = fsha_denormalize(images, self.dataset)
-                for i in range(images.shape[0]):
-                    psnr.append(compute_psnr(orig[i], rec[i]))
-                    ssim.append(compute_ssim(orig[i].unsqueeze(0), rec[i].unsqueeze(0)))
-                    mse.append(compute_mse(orig[i], rec[i]))
-                if vis_o is None:
-                    vis_o, vis_r = orig[:8].cpu(), rec[:8].cpu()
-                seen += images.shape[0]
-        summary = {'mse': float(np.mean(mse)), 'psnr': float(np.mean(psnr)), 'ssim': float(np.mean(ssim))}
-        print(f"  FSHA vs {self.tag}: PSNR {summary['psnr']:.2f} dB | SSIM {summary['ssim']:.4f} | MSE {summary['mse']:.5f}")
-        self._save_visualization(vis_o, vis_r, tag=self.tag)
-        return summary
+        super().__init__(*args, view_fn=view_fn, tag=tag, **kw)
 
 
 def run_fsha_vs_view(view_fn, in_channels, private_loader, public_loader, tag, epochs=5, num_images=32,
-                     client_builder=None):
+                     client_builder=None, iterations=None):
     builder = client_builder or (lambda: build_client(in_channels))
     attack = DefendedFSHAAttack(client_model=builder(), in_channels=in_channels, dataset=Config.DATASET,
                                 pilot_builder=builder, critic_iters=5, view_fn=view_fn, tag=tag)
-    attack.hijack(private_loader, public_loader, epochs=epochs)
+    attack.hijack(private_loader, public_loader, epochs=epochs, iterations=iterations)
     return attack.reconstruct(private_loader, num_images=num_images)
 
 EPSILON_VALUES   = [0.1, 0.5, 1.0, 2.0, 4.0]
@@ -173,7 +129,7 @@ PROTECT_BACKWARD = True
 DYNAMIC_BUDGET   = True
 EPOCHS_PER_EPS   = 10
 
-RUN_WHITEBOX, RUN_AE, RUN_FSHA = True, True, True
+RUN_WHITEBOX, RUN_AE, RUN_FSHA, RUN_FORA = True, True, True, True
 MAX_IMAGES, ITERATIONS         = 32, 1000
 AE_EPOCHS, FSHA_EPOCHS         = 50, 5
 RUN_UNSPLIT   = True
@@ -202,21 +158,30 @@ POISON_TRAIN_EPOCHS = 5
 QUICK_TEST = False
 
 
+def run_fora_vs_view(client_model, view_fn, private_loader, public_loader, device, in_channels):
+    victim = DefendedClient(client_model, view_fn)
+    atk = FORAAttack(victim_client=victim, substitute_builder=lambda: build_client(in_channels),
+                     in_channels=in_channels, dataset=Config.DATASET, tag='r3elu')
+    atk.run(private_loader, public_loader, iterations=FORA_ITERS)
+    s = atk.reconstruct(public_loader, num_images=MAX_IMAGES)
+    return {'psnr': s['psnr'], 'ssim': s['ssim']}
+
+
 def attack_suite(client_model, view_fn, train_loader, test_loader, device, in_channels, tag):
     row = {}
-    if RUN_WHITEBOX:
+    if RUN_WHITEBOX and attack_allowed('whitebox'):
         s = run_whitebox_vs_view(client_model, view_fn, test_loader, device, Config.DATASET, MAX_IMAGES, ITERATIONS)
         row.update(wb_psnr=s['mean_psnr'], wb_ssim=s['mean_ssim'])
-    if RUN_AE:
+    if RUN_AE and attack_allowed('ae_decoder'):
         s, _, _ = run_ae_decoder_attack(DefendedClient(client_model, view_fn), train_loader, test_loader, device,
                                         Config.DATASET, ae_epochs=AE_EPOCHS, label=f'AE Decoder vs {tag}')
         row.update(ae_psnr=s['mean_psnr'], ae_ssim=s['mean_ssim'])
-    if RUN_FSHA:
+    if RUN_FSHA and attack_allowed('fsha'):
         s = run_fsha_vs_view(view_fn, in_channels, train_loader, test_loader, tag=tag, epochs=FSHA_EPOCHS)
         row.update(fsha_psnr=s['psnr'], fsha_ssim=s['ssim'])
-    if RUN_UNSPLIT:
-        s = run_unsplit_vs_view(client_model, view_fn, test_loader, in_channels, lambda: build_client(in_channels))
-        row.update(us_psnr=s['psnr'], us_ssim=s['ssim'])
+    if RUN_FORA and attack_allowed('fora'):
+        s = run_fora_vs_view(client_model, view_fn, train_loader, test_loader, device, in_channels)
+        row.update(fora_psnr=s['psnr'], fora_ssim=s['ssim'])
     return row
 
 
@@ -225,21 +190,24 @@ import inspect
 import random
 import traceback
 
-ATTACKS_TO_RUN = ["label_leakage", "villain", "poison_client", "poison_server",
-                  "whitebox", "unsplit", "ae_decoder", "fsha"]
+ATTACKS_TO_RUN = ["label_leakage", "similarity_label", "poison_client", "poison_server",
+                  "whitebox", "ae_decoder", "fsha", "fora", "pcat", "property", "membership"]
 
 ATTACK_INFO = {
     "label_leakage": ("Label Leakage (norm + cosine gradient scoring)", "label_inference"),
-    "villain":       ("VILLAIN backdoor (label inference + embedding trigger)", "backdoor"),
+    "similarity_label": ("Similarity label inference (gradient clustering)", "label_cluster"),
     "poison_client": ("Backdoor poisoning, client attacker (BadNets patch)", "backdoor"),
     "poison_server": ("Backdoor poisoning, server attacker (surrogate client)", "backdoor"),
     "whitebox":      ("White-box model inversion", "reconstruction"),
-    "unsplit":       ("UnSplit model inversion", "reconstruction"),
     "ae_decoder":    ("AE decoder inversion", "reconstruction"),
     "fsha":          ("FSHA feature-space hijacking", "reconstruction"),
+    "fora":          ("FORA feature-oriented reconstruction", "reconstruction"),
+    "pcat":          ("PCAT pseudo-client functionality stealing", "model_stealing"),
+    "property":      ("Property inference (Mao et al.)", "property"),
+    "membership":    ("Membership inference (Shokri et al.)", "membership"),
 }
 
-RECON_KEYS = {"whitebox": "wb", "unsplit": "us", "ae_decoder": "ae", "fsha": "fsha"}
+RECON_KEYS = {"whitebox": "wb", "ae_decoder": "ae", "fsha": "fsha", "fora": "fora"}
 
 SUCCESS, PARTIAL, FAILED, NOT_APPLICABLE, WEAK, BASELINE = \
     "SUCCESS", "PARTIAL", "FAILED", "N/A", "ATTACK-WEAK", "BASELINE"
@@ -253,6 +221,12 @@ THRESHOLDS = {
     'ssim_partial_drop': 0.10,
     'psnr_partial_drop': 3.0,
     'utility_tolerance_pct': 5.0,
+    'steal_drop': 10.0,
+    'prop_success': 55.0,
+    'prop_drop': 5.0,
+    'mia_success': 0.55,
+    'mia_drop': 0.03,
+    'cluster_margin': 0.10,
 }
 
 SUMMARY_COLUMNS = [
@@ -281,6 +255,46 @@ def judge(family, base, dfd, psnr_base=None, psnr_dfd=None):
         thr, drop, name, fmt = t['leak_auc_success'], t['leak_auc_partial_drop'], "leak AUC", ".3f"
     elif family == "backdoor":
         thr, drop, name, fmt = t['asr_success'], t['asr_partial_drop'], "ASR %", ".1f"
+    elif family == "label_cluster":
+        base, dfd = float(base), float(dfd)
+        chance = 1.0 / float(Config.NUM_CLASSES)
+        thr = chance + t['cluster_margin']
+        change = f"cluster acc {base:.3f} -> {dfd:.3f} (chance {chance:.2f})"
+        if base < thr:
+            return WEAK, f"attack already weak without defense (cluster acc {base:.3f} < {thr:.3f})"
+        if dfd < thr:
+            return SUCCESS, f"{change} (back to chance)"
+        if base - dfd >= t['cluster_margin']:
+            return PARTIAL, f"{change} (reduced)"
+        return FAILED, f"{change} (attack still works)"
+    elif family == "model_stealing":
+        base, dfd = float(base), float(dfd)
+        change = f"stolen acc {base:.1f} -> {dfd:.1f}"
+        if base - dfd >= t['steal_drop']:
+            return SUCCESS, f"{change} (stolen accuracy cut by >= {t['steal_drop']})"
+        if base - dfd >= t['steal_drop'] / 2:
+            return PARTIAL, f"{change} (partially reduced)"
+        return FAILED, f"{change} (stealing still works)"
+    elif family == "property":
+        base, dfd = float(base), float(dfd)
+        change = f"prop acc {base:.1f} -> {dfd:.1f}"
+        if base < t['prop_success']:
+            return WEAK, f"attack already weak without defense ({base:.1f} < {t['prop_success']})"
+        if dfd < t['prop_success']:
+            return SUCCESS, f"{change} (below {t['prop_success']})"
+        if base - dfd >= t['prop_drop']:
+            return PARTIAL, f"{change} (reduced)"
+        return FAILED, f"{change} (attack still works)"
+    elif family == "membership":
+        base, dfd = float(base), float(dfd)
+        change = f"AUC {base:.3f} -> {dfd:.3f}"
+        if base < t['mia_success']:
+            return WEAK, f"attack already weak without defense (AUC {base:.3f} < {t['mia_success']})"
+        if dfd < t['mia_success']:
+            return SUCCESS, f"{change} (below {t['mia_success']})"
+        if base - dfd >= t['mia_drop']:
+            return PARTIAL, f"{change} (reduced)"
+        return FAILED, f"{change} (attack still works)"
     else:
         thr, drop, name, fmt = t['ssim_success'], t['ssim_partial_drop'], "SSIM", ".3f"
     base, dfd = float(base), float(dfd)
@@ -298,8 +312,9 @@ def judge(family, base, dfd, psnr_base=None, psnr_dfd=None):
 def finalize_row(row):
     a0, a1 = row.get('accuracy_no_defense'), row.get('accuracy_with_defense')
     row['delta_accuracy'] = float(a1) - float(a0) if not (_missing(a0) or _missing(a1)) else float('nan')
-    row.setdefault('metric', {"label_inference": "LeakAUC", "backdoor": "ASR%",
-                              "reconstruction": "SSIM"}[row['attack_family']])
+    row.setdefault('metric', {"label_inference": "LeakAUC", "backdoor": "ASR%", "reconstruction": "SSIM",
+                              "model_stealing": "StolenAcc", "property": "PropAcc",
+                              "membership": "AUC", "label_cluster": "ClusterAcc"}[row['attack_family']])
     if row.get('verdict') in (NOT_APPLICABLE, BASELINE):
         row['defense_working'] = "N/A" if row['verdict'] == NOT_APPLICABLE else "-"
         row.setdefault('reason', "")
@@ -405,16 +420,6 @@ def _metric(d, *names):
     return float('nan')
 
 
-def run_unsplit_vs_view(client_model, view_fn, test_loader, in_channels, clone_builder):
-    from all_attacks.attack_unsplit import UnSplitAttack
-    n_batches = max(1, MAX_IMAGES // Config.BATCH_SIZE)
-    attacker = call_with_supported_args(UnSplitAttack, client_model=DefendedClient(client_model, view_fn),
-                                        in_channels=in_channels, clone_builder=clone_builder)
-    m = call_with_supported_args(attacker.run_attack, test_loader, num_batches=n_batches,
-                                 inversion_steps=UNSPLIT_STEPS)
-    return {'psnr': _metric(m, 'psnr', 'mean_psnr'), 'ssim': _metric(m, 'ssim', 'mean_ssim')}
-
-
 def recon_budget(attack_key, n_train_batches):
     if attack_key == "whitebox":
         return 0, ITERATIONS * MAX_IMAGES, "inversion steps (steps per image x images)"
@@ -476,7 +481,7 @@ def print_run_info(r):
     print(f"  Result: {r['defense_working']} -- {r.get('reason', '')}")
 
 
-from all_defences.r3elu_defense import R3eLU
+from existing_defense.r3elu_defense import R3eLU
 
 
 def model_tag():
@@ -567,30 +572,6 @@ def r3elu_label_leakage(eps, n_features, base_dataset, in_channels):
             "calls": wrapper.calls if wrapper else 0}
 
 
-def r3elu_villain(eps, n_features, base_dataset, test_loader, in_channels):
-    from all_attacks.villain_backdoor_attack import VILLAINBackdoorAttack, build_indexed_loader
-    _seed()
-    attack = VILLAINBackdoorAttack(client_model=build_client(in_channels),
-                                   server_model=build_server_n(in_channels, Config.NUM_CLASSES),
-                                   base_dataset=base_dataset, dataset=Config.DATASET, num_classes=Config.NUM_CLASSES,
-                                   target_label=VILLAIN_TARGET, poison_rate=VILLAIN_POISON,
-                                   candidates_per_batch=VILLAIN_CANDIDATES)
-    wrapper = None
-    if eps is not None:
-        wrapper = R3eLUProtectedServer(attack.server_model, make_mech(eps, n_features, attack.device))
-        attack.server_model = wrapper
-    loader = build_indexed_loader(base_dataset, batch_size=VILLAIN_BATCH, shuffle=True)
-    attack.warmup(loader, epochs=VILLAIN_WARMUP)
-    attack.infer_labels(loader, epochs=VILLAIN_INFERENCE)
-    attack.fabricate_trigger(loader)
-    attack.inject_backdoor(loader, test_loader, epochs=VILLAIN_INJECTION)
-    cda, asr = attack.evaluate(test_loader)
-    total = VILLAIN_WARMUP + VILLAIN_INFERENCE + VILLAIN_INJECTION
-    return {"acc": cda, "metric": asr, "lia": 100.0 * attack.label_inference_accuracy(), "attack_epochs": total,
-            "iterations": len(loader) * total, "unit": "training steps (train batches x all VILLAIN epochs)",
-            "calls": wrapper.calls if wrapper else 0}
-
-
 def r3elu_poison_client(eps, n_features, base_dataset, train_loader, test_loader, in_channels):
     from all_attacks.backdoor_poison_attack import BackdoorPoisonAttack
     _seed()
@@ -612,15 +593,142 @@ def r3elu_poison_client(eps, n_features, base_dataset, train_loader, test_loader
             "calls": wrapper.calls if wrapper else 0}
 
 
-TRAINING_ATTACKS = {"label_leakage": r3elu_label_leakage, "villain": r3elu_villain,
+def r3elu_similarity(eps, n_features, base_dataset, in_channels):
+    _seed()
+    loader = DataLoader(base_dataset, batch_size=LEAK_BATCH, shuffle=True)
+    attack = SimilarityLabelInferenceAttack(client_model=build_client(in_channels),
+                                            server_model=build_server_n(in_channels, Config.NUM_CLASSES),
+                                            dataset=Config.DATASET, num_classes=Config.NUM_CLASSES,
+                                            distance='cosine', victim='gradient')
+    wrapper = None
+    if eps is not None:
+        wrapper = R3eLUProtectedServer(attack.server_model, make_mech(eps, n_features, attack.device))
+        attack.server_model = wrapper
+    summary = attack.run(loader, epochs=SIM_EPOCHS)
+    return {"acc": float('nan'), "metric": summary['cluster_accuracy'], "attack_epochs": SIM_EPOCHS,
+            "iterations": len(loader) * SIM_EPOCHS, "unit": "training steps (batches x epochs)",
+            "calls": wrapper.calls if wrapper else 0}
+
+
+TRAINING_ATTACKS = {"label_leakage": r3elu_label_leakage, "similarity_label": r3elu_similarity,
                     "poison_client": r3elu_poison_client}
 
 
+
+def run_pcat_defended(raw, device, n_features, model_label, cut_label, all_rows, all_out):
+    def one(eps):
+        hook = R3eLU(make_mech(eps, n_features, device)).to(device) if eps is not None else None
+        atk = PCATAttack(Config.MODEL_NAME, Config.CUT_LAYER, Config.DATASET, raw, device,
+                         defense_hook=hook, epochs=EPOCHS_PER_EPS, vanilla_iters=PCAT_VANILLA_ITERS,
+                         tag='r3elu' if eps is not None else 'no_defense')
+        return atk.run()
+    base = None
+    try:
+        base = one(None)
+    except Exception:
+        traceback.print_exc()
+    for eps in EPSILON_VALUES:
+        try:
+            r = one(eps)
+            row = finalize_row(summary_row('pcat', f'r3elu_eps{eps}', model_label, cut_label,
+                attack_epochs=r['epochs'], defense_epochs=r['epochs'],
+                defense_stage='SL with R3eLU-forward on smashed data', attack_iterations=float('nan'),
+                iteration_unit='SL epochs', defense_calls=float('nan'),
+                accuracy_no_defense=base['victim_acc'] if base else float('nan'),
+                accuracy_with_defense=r['victim_acc'],
+                metric_no_defense=base['pcat_stolen_acc'] if base else float('nan'),
+                metric_with_defense=r['pcat_stolen_acc'], note=f"independent {r['independent_acc']:.1f}%"))
+        except Exception as exc:
+            traceback.print_exc()
+            row = na_row('pcat', f'r3elu_eps{eps}', model_label, cut_label, f"run failed: {type(exc).__name__}: {exc}")
+        print_run_info(row); all_rows.append(row); save_results(all_rows, all_out)
+
+
+def run_property_defended(raw, device, n_features, model_label, cut_label, all_rows, all_out):
+    def best(eps):
+        rows = []
+        for prop in PROPERTIES[Config.DATASET]:
+            atk = MaoPropertyInference(Config.MODEL_NAME, Config.CUT_LAYER, Config.DATASET, raw, device, prop,
+                                       n_aux=PROP_N_AUX, n_eval=PROP_N_EVAL, attack_epochs=PROP_EPOCHS,
+                                       victim_epochs=EPOCHS_PER_EPS, tag='r3elu' if eps is not None else 'no_defense')
+            if eps is not None:
+                mech = make_mech(eps, n_features, device)
+                atk.client_forward = (lambda m, a: (lambda x: m.forward_perturb(a.client(x))))(mech, atk)
+            rows.append(atk.run())
+        return max(rows, key=lambda r: r['advantage_over_chance'])
+    base = None
+    try:
+        base = best(None)
+    except Exception:
+        traceback.print_exc()
+    for eps in EPSILON_VALUES:
+        try:
+            r = best(eps)
+            row = finalize_row(summary_row('property', f'r3elu_eps{eps}', model_label, cut_label,
+                attack_epochs=PROP_EPOCHS, defense_epochs=EPOCHS_PER_EPS,
+                defense_stage='inference: R3eLU-forward on smashed data', attack_iterations=float('nan'),
+                iteration_unit='F training epochs', defense_calls=float('nan'),
+                accuracy_no_defense=base['victim_test_acc'] if base else float('nan'),
+                accuracy_with_defense=r['victim_test_acc'],
+                metric_no_defense=base['pia_accuracy'] if base else float('nan'),
+                metric_with_defense=r['pia_accuracy'], note=f"best property {r['property']}"))
+        except Exception as exc:
+            traceback.print_exc()
+            row = na_row('property', f'r3elu_eps{eps}', model_label, cut_label, f"run failed: {type(exc).__name__}: {exc}")
+        print_run_info(row); all_rows.append(row); save_results(all_rows, all_out)
+
+
+def run_membership_defended(raw, device, n_features, model_label, cut_label, all_rows, all_out):
+    def predict_defended(mech):
+        def pf(client, server, x):
+            return torch.softmax(server(mech.forward_perturb(client(x))), dim=1)
+        return pf
+    base = None
+    try:
+        base = ShokriMembershipInference(Config.MODEL_NAME, Config.CUT_LAYER, Config.DATASET, raw, device,
+                                         target_size=MIA_TARGET, num_shadows=MIA_SHADOWS, epochs=EPOCHS_PER_EPS,
+                                         tag='no_defense').run()
+    except Exception:
+        traceback.print_exc()
+    for eps in EPSILON_VALUES:
+        try:
+            mech = make_mech(eps, n_features, device)
+            r = ShokriMembershipInference(Config.MODEL_NAME, Config.CUT_LAYER, Config.DATASET, raw, device,
+                                          target_size=MIA_TARGET, num_shadows=MIA_SHADOWS, epochs=EPOCHS_PER_EPS,
+                                          predict_fn=predict_defended(mech), tag=f'r3elu_eps{eps}').run()
+            row = finalize_row(summary_row('membership', f'r3elu_eps{eps}', model_label, cut_label,
+                attack_epochs=EPOCHS_PER_EPS, defense_epochs=0,
+                defense_stage='inference: R3eLU-forward on the prediction vector', attack_iterations=float('nan'),
+                iteration_unit='shadow epochs', defense_calls=float('nan'),
+                accuracy_no_defense=base['target_train_acc'] if base else float('nan'),
+                accuracy_with_defense=r['target_train_acc'],
+                metric_no_defense=base['mia_auc'] if base else float('nan'),
+                metric_with_defense=r['mia_auc'], note=f"attack acc {r['mia_accuracy']:.1f}%"))
+        except Exception as exc:
+            traceback.print_exc()
+            row = na_row('membership', f'r3elu_eps{eps}', model_label, cut_label, f"run failed: {type(exc).__name__}: {exc}")
+        print_run_info(row); all_rows.append(row); save_results(all_rows, all_out)
+
+
 if __name__ == "__main__":
-    if QUICK_TEST:
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--model', default=Config.MODEL_NAME, choices=['KAGN', 'PyramidCNN'])
+    ap.add_argument('--cut', type=int, default=Config.CUT_LAYER, choices=[1, 2, 3, 4])
+    ap.add_argument('--dataset', default=Config.DATASET, choices=['CIFAR10', 'MNIST'])
+    ap.add_argument('--quick', action='store_true')
+    ap.add_argument('--all-eps', action='store_true')
+    _a = ap.parse_args()
+    Config.MODEL_NAME, Config.CUT_LAYER, Config.DATASET = _a.model, _a.cut, _a.dataset
+    _VALID = DE.load_valid_configs()
+    if not _a.all_eps:
+        EPSILON_VALUES = [1.0]
+    if _a.quick:
         EPSILON_VALUES, EPOCHS_PER_EPS = [1.0], 1
-        MAX_IMAGES, ITERATIONS, AE_EPOCHS, FSHA_EPOCHS, UNSPLIT_STEPS = 4, 20, 2, 1, 20
-        LEAK_EPOCHS = VILLAIN_WARMUP = VILLAIN_INFERENCE = VILLAIN_INJECTION = POISON_TRAIN_EPOCHS = 1
+        MAX_IMAGES, ITERATIONS, AE_EPOCHS, FSHA_EPOCHS = 4, 20, 2, 1
+        LEAK_EPOCHS = SIM_EPOCHS = POISON_TRAIN_EPOCHS = 1
+        FORA_ITERS = 30
+        PCAT_VANILLA_ITERS, PROP_N_AUX, PROP_N_EVAL, PROP_EPOCHS = 50, 500, 1000, 3
+        MIA_SHADOWS, MIA_TARGET = 2, 300
     device = torch.device(Config.DEVICE if torch.cuda.is_available() else 'cpu')
     print(f"Using execution device: {device}")
     train_loader, test_loader = DatasetLoader(dataset_name=Config.DATASET).get_loaders()
@@ -702,14 +810,14 @@ if __name__ == "__main__":
                                EPOCHS_PER_EPS, stage, base_acc, r['accuracy'], {})
 
     for attack_key, fn in TRAINING_ATTACKS.items():
-        if attack_key not in ATTACKS_TO_RUN:
+        if attack_key not in ATTACKS_TO_RUN or not attack_allowed(attack_key):
             continue
         print("\n" + "#" * 78)
         print(f"#   R3eLU vs {attack_key} -- {ATTACK_INFO[attack_key][0]}")
         print(f"#   MODEL: {model_label} | CUT LAYER: {cut_label} | {Config.DATASET}")
         print("#" * 78)
         args = {"label_leakage": (n_features, base_dataset, in_channels),
-                "villain": (n_features, base_dataset, test_loader, in_channels),
+                "similarity_label": (n_features, base_dataset, in_channels),
                 "poison_client": (n_features, base_dataset, train_loader, test_loader, in_channels)}[attack_key]
         try:
             print(f"\n  >> {attack_key}: baseline (no defense)")
@@ -740,7 +848,7 @@ if __name__ == "__main__":
             all_rows.append(row)
             save_results(all_rows, all_out)
 
-    if "poison_server" in ATTACKS_TO_RUN:
+    if "poison_server" in ATTACKS_TO_RUN and attack_allowed("poison_server"):
         print("\n" + "#" * 78)
         print(f"#   R3eLU vs poison_server -- {ATTACK_INFO['poison_server'][0]}")
         print("#" * 78)
@@ -754,7 +862,7 @@ if __name__ == "__main__":
         print(f"  Poisoned checkpoint path: {atk._checkpoint_path()}")
         if not atk.load_checkpoint():
             print(f"\n[!] No poisoned checkpoint found at: {atk._checkpoint_path()}")
-            print("    Run defence_runner/run_backdoor_poison.py first to produce it. Skipping.")
+            print("    Run attack_runner/run_backdoor_poison.py first to produce it. Skipping.")
             for eps in EPSILON_VALUES:
                 all_rows.append(na_row("poison_server", f"r3elu_eps{eps}", model_label, cut_label,
                                        f"no poisoned checkpoint at {atk._checkpoint_path()}"))
@@ -776,6 +884,15 @@ if __name__ == "__main__":
                 print_run_info(row)
                 all_rows.append(row)
         save_results(all_rows, all_out)
+
+    if any(attack_allowed(k) for k in ('pcat', 'property', 'membership')):
+        raw_env = load_raw_datasets(Config.DATASET)
+        if attack_allowed('pcat'):
+            run_pcat_defended(raw_env, device, n_features, model_label, cut_label, all_rows, all_out)
+        if attack_allowed('property'):
+            run_property_defended(raw_env, device, n_features, model_label, cut_label, all_rows, all_out)
+        if attack_allowed('membership'):
+            run_membership_defended(raw_env, device, n_features, model_label, cut_label, all_rows, all_out)
 
     order = {a: i for i, a in enumerate(ATTACKS_TO_RUN)}
     all_rows.sort(key=lambda r: order.get(r["attack"], 99))

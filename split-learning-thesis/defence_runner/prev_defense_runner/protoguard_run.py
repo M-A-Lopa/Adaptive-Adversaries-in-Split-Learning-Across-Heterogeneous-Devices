@@ -1,5 +1,8 @@
 import sys, os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_r = os.path.dirname(os.path.abspath(__file__))
+while not os.path.exists(os.path.join(_r, 'config.py')) and os.path.dirname(_r) != _r:
+    _r = os.path.dirname(_r)
+sys.path.append(_r)
 
 import inspect
 import math
@@ -19,7 +22,7 @@ from dataset import DatasetLoader
 from all_model.models import ClientModel, ServerModel
 from all_model.kagn_models import KAGNClientModel, KAGNServerModel
 from all_model.pyramid_cnn import PyramidCNNClientModel, PyramidCNNServerModel
-from all_defences.protoguard_sl_defense import ProtoGuardSLDefense
+from existing_defense.protoguard_sl_defense import ProtoGuardSLDefense
 
 
 SEED = 0
@@ -566,7 +569,7 @@ class Experiment:
         print(f"  Poisoned checkpoint path: {attack._checkpoint_path()}")
         if not attack.load_checkpoint():
             print(f"\n[!] No poisoned checkpoint found at: {attack._checkpoint_path()}")
-            print("    Run defence_runner/run_backdoor_poison.py first to produce it. Skipping.")
+            print("    Run attack_runner/run_backdoor_poison.py first to produce it. Skipping.")
             r = self.row(attack_key, f"protoguard_a{ALPHA:g}")
             r.update({"verdict": NOT_APPLICABLE, "threat_model": threat_model(attack_key),
                       "reason": f"no poisoned checkpoint at {attack._checkpoint_path()} "
@@ -859,7 +862,7 @@ if __name__ == "__main__":
                for r in all_rows if "protoguard_asr" in r]
     if not results:
         print("\n  No poisoned checkpoints were found -- nothing to evaluate.")
-        print("  Run defence_runner/run_backdoor_poison.py first (same cut layer).")
+        print("  Run attack_runner/run_backdoor_poison.py first (same cut layer).")
     else:
         df = pd.DataFrame(results)
         output_path = f"{Config.RESULTS_DIR}/protoguard_sl_defense_evaluation_{Config.DATASET}.csv"

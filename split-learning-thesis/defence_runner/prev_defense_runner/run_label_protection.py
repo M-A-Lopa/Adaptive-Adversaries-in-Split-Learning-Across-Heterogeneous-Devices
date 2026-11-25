@@ -1,5 +1,8 @@
 import sys, os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_r = os.path.dirname(os.path.abspath(__file__))
+while not os.path.exists(os.path.join(_r, 'config.py')) and os.path.dirname(_r) != _r:
+    _r = os.path.dirname(_r)
+sys.path.append(_r)
 
 import math
 import random
@@ -17,7 +20,7 @@ from all_model.models import ClientModel, ServerModel
 from all_model.kagn_models import KAGNClientModel, KAGNServerModel
 from all_model.pyramid_cnn import PyramidCNNClientModel, PyramidCNNServerModel
 from all_attacks.label_leakage_attack import GradientNormLabelLeakageAttack, build_binary_split_loaders
-from all_defences.label_protection_defense import (LabelProtectionDefense, attach_label_protection,
+from existing_defense.label_protection_defense import (LabelProtectionDefense, attach_label_protection,
                                                    LabelAwareCriterion)
 
 

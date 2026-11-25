@@ -1,12 +1,15 @@
 import sys, os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_r = os.path.dirname(os.path.abspath(__file__))
+while not os.path.exists(os.path.join(_r, 'config.py')) and os.path.dirname(_r) != _r:
+    _r = os.path.dirname(_r)
+sys.path.append(_r)
 
 import torch
 import pandas as pd
 from torch.utils.data import DataLoader
 from config import Config
 from dataset import DatasetLoader
-from all_defences.splitfss_defense import (SplitFSSDefense, SplitFSSMiniONNClient, SplitFSSLeNetClient,
+from existing_defense.splitfss_defense import (SplitFSSDefense, SplitFSSMiniONNClient, SplitFSSLeNetClient,
                                            build_fss_server_head, smashed_features)
 from all_split_learning.splitfss_split_learning import SplitFSSTrainer
 from all_attacks.ae_decoder_attack import run_ae_decoder_attack

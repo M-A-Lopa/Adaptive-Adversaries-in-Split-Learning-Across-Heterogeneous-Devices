@@ -1,5 +1,8 @@
 import sys, os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_r = os.path.dirname(os.path.abspath(__file__))
+while not os.path.exists(os.path.join(_r, 'config.py')) and os.path.dirname(_r) != _r:
+    _r = os.path.dirname(_r)
+sys.path.append(_r)
 
 import math
 import random
@@ -17,7 +20,7 @@ from all_model.models import ClientModel, ServerModel
 from all_model.kagn_models import KAGNClientModel, KAGNServerModel
 from all_model.pyramid_cnn import PyramidCNNClientModel, PyramidCNNServerModel
 from all_split_learning.splitguard_split_learning import SplitGuardTrainer
-from all_defences.splitguard_defense import (SplitGuardDefense, PAPER_POLICIES, SG_THRESHOLD,
+from existing_defense.splitguard_defense import (SplitGuardDefense, PAPER_POLICIES, SG_THRESHOLD,
                                              AF_TOLERANCE, A_ESTIMATORS)
 
 
@@ -444,7 +447,7 @@ if __name__ == "__main__":
                     print(f"  Poisoned checkpoint path: {atk._checkpoint_path()}")
                     if not atk.load_checkpoint():
                         print(f"\n[!] No poisoned checkpoint found at: {atk._checkpoint_path()}")
-                        print("    Run defence_runner/run_backdoor_poison.py first to produce it. Skipping.")
+                        print("    Run attack_runner/run_backdoor_poison.py first to produce it. Skipping.")
                         row.update({"verdict": NOT_APPLICABLE, "defense_calls": 0, "defense_epochs": 0,
                                     "attack_iterations": float('nan'), "attack_epochs": float('nan'),
                                     "accuracy_no_defense": float('nan'), "metric_no_defense": float('nan'),
